@@ -1,0 +1,8 @@
+numpy
+scipy
+h5py
+geopandas
+shapely
+pyogrio
+gdal
+
