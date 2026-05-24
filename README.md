@@ -1,6 +1,6 @@
-# StaMPS Refactor Project
+# StaMPS-PyRefactor
 
-StaMPS Refactor Project is a Python port and workflow refactor of the MATLAB
+StaMPS-PyRefactor is a Python port and workflow refactor of the MATLAB
 StaMPS Persistent Scatterer InSAR processing chain. The repository keeps the
 original MATLAB StaMPS source under `stamps_matlab/` for reference and provides
 the translated Python implementation under `stamps_python/`.
@@ -174,4 +174,3 @@ This project is based on StaMPS (Stanford Method for Persistent Scatterers) and
 retains the original MATLAB source for reference. Please cite the appropriate
 StaMPS publications and respect the GPL-3.0 license when using or distributing
 this work.
-
