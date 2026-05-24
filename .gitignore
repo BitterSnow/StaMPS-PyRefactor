@@ -47,3 +47,6 @@ test_data/
 .claude/
 提示词.txt
 
+# Local GitHub SSH keys
+github
+github.pub
