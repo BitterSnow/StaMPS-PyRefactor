@@ -50,3 +50,6 @@ test_data/
 # Local GitHub SSH keys
 github
 github.pub
+
+# Local MATLAB StaMPS source reference
+stamps_matlab/

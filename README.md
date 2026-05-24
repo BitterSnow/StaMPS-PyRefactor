@@ -1,9 +1,10 @@
 # StaMPS-PyRefactor
 
 StaMPS-PyRefactor is a Python port and workflow refactor of the MATLAB
-StaMPS Persistent Scatterer InSAR processing chain. The repository keeps the
-original MATLAB StaMPS source under `stamps_matlab/` for reference and provides
-the translated Python implementation under `stamps_python/`.
+StaMPS Persistent Scatterer InSAR processing chain. The repository provides the
+translated Python implementation under `stamps_python/`. The original MATLAB
+StaMPS source is used as a local translation reference, but is not vendored in
+this Git repository.
 
 The current focus is PS-InSAR processing for ISCE/ISCE2 stack outputs. The goal
 is not to reproduce the MATLAB plotting GUI, but to make the processing and
@@ -15,16 +16,15 @@ StaMPS distribution.
 
 ## License
 
-The original StaMPS code in this repository is licensed under the GNU General
-Public License v3.0. This Python refactor is derived from and distributed with
-that code, so the project is released under the same license: GPL-3.0.
+StaMPS is licensed under the GNU General Public License v3.0. This Python
+refactor is derived from the StaMPS workflow and translation reference, so the
+project is released under the same license: GPL-3.0.
 
 See [LICENSE](LICENSE).
 
 ## Repository Layout
 
 ```text
-stamps_matlab/      Original MATLAB StaMPS source used as translation reference
 stamps_python/      Python implementation of preprocessing, Steps 1-8, and export
 stamps_python/docs/ Migration plans, validation notes, and runbooks
 OPERATION_MANUAL.md Historical operation notes
@@ -171,6 +171,6 @@ python stamps_python/export_results.py \
 ## Citation / Attribution
 
 This project is based on StaMPS (Stanford Method for Persistent Scatterers) and
-retains the original MATLAB source for reference. Please cite the appropriate
-StaMPS publications and respect the GPL-3.0 license when using or distributing
-this work.
+uses the original MATLAB implementation as a translation reference. Please cite
+the appropriate StaMPS publications and respect the GPL-3.0 license when using
+or distributing this work.
