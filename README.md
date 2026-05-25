@@ -140,6 +140,7 @@ python stamps_python/prep_isce.py path/to/merged \
   --output validation_runs/prep_isce_ps \
   --range-patches 8 \
   --azimuth-patches 2 \
+  --da-thresh 0.4 \
   --run-calamp \
   --run-select \
   --run-extract \
@@ -150,9 +151,10 @@ python stamps_python/prep_isce.py path/to/merged \
 This command discovers co-registered SLCs from `SLC/YYYYMMDD/*.slc.full`, infers
 `width.txt`, `len.txt`, acquisition dates, master date, baselines, heading, and
 wavelength where available, extracts longitude/latitude/DEM/incidence angle from
-`geom_reference/`, and writes Python-compatible `PATCH_*/ps1.h5` inputs. If the
-master date cannot be inferred from the stack metadata, pass it explicitly with
-`--master-date YYYYMMDD`.
+`geom_reference/`, and writes Python-compatible `PATCH_*/ps1.h5` inputs.
+`--da-thresh` controls the amplitude-dispersion threshold used during PS
+candidate selection; the default is `0.4`. If the master date cannot be inferred
+from the stack metadata, pass it explicitly with `--master-date YYYYMMDD`.
 
 Example command matching the project full-stack validation run, assuming the
 ISCE2 `merged` directory has been placed under `test_data/merged`:
@@ -162,6 +164,7 @@ python stamps_python/prep_isce.py test_data/merged \
   --output validation_runs/prep_isce_real_full_ps_8x2 \
   --range-patches 8 \
   --azimuth-patches 2 \
+  --da-thresh 0.4 \
   --run-calamp \
   --run-select \
   --run-extract \
