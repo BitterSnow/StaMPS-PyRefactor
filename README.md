@@ -26,9 +26,7 @@ See [LICENSE](LICENSE).
 
 ```text
 stamps_python/      Python implementation of preprocessing, Steps 1-8, and export
-stamps_python/docs/ Migration plans, validation notes, and runbooks
 OPERATION_MANUAL.md Historical operation notes
-VALIDATION_PLAN.md  Translation validation checklist
 ```
 
 Large datasets, generated HDF5/MAT files, GeoPackages, Shapefiles, logs, and

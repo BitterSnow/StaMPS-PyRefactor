@@ -69,7 +69,6 @@ project_root/
 │   ├── PATCH_437/          # Patch 数据
 │   ├── PATCH_438/          # Patch 数据
 │   └── *.raw, *.in, ...    # ISCE 原始数据
-└── CLAUDE.md               # 项目约定文档
 ```
 
 ---

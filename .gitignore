@@ -44,6 +44,11 @@ test_data/
 *.err
 
 # Local notes / prompts
+CLAUDE.md
+VALIDATION_PLAN.md
+stamps_python/docs/
+*PLAN*.md
+*plan*.md
 .claude/
 提示词.txt
 
