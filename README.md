@@ -63,6 +63,9 @@ validation runs are intentionally ignored by Git.
   - large HDF5 `bperp_mat` reads avoid slow fancy indexing
 - Step 4/5 save and merge bottlenecks have been optimized.
 - Incidence-angle extraction from ISCE2 `incLocal.rdr.full` is supported.
+- ISCE2 small-baseline preprocessing can consume existing ISCE2 interferograms
+  with `--small-baseline`, generating `ifgday.1.in`, `small_baselines.list`,
+  paired-SLC candidate selection inputs, and SB-compatible `ps1.h5` products.
 - Result export is implemented:
   - velocity in mm/yr
   - displacement time series in mm
@@ -104,10 +107,63 @@ Install dependencies in a Python environment:
 pip install -r requirements.txt
 ```
 
-Prepare ISCE2 stack data:
+Inspect preprocessing options:
 
 ```bash
 python stamps_python/prep_isce.py --help
+```
+
+Prepare an ISCE2 SLC stack for the PS-InSAR workflow. The input directory should
+be the ISCE2 `merged` directory produced by the SLC stack workflow, for example:
+
+```text
+merged/
+  baselines/
+  geom_reference/
+    hgt.rdr.full
+    incLocal.rdr.full
+    lat.rdr.full
+    lon.rdr.full
+  SLC/
+    20200101/
+      20200101.slc.full
+      20200101.slc.full.xml
+    20200113/
+      20200113.slc.full
+      20200113.slc.full.xml
+```
+
+Run preprocessing from the repository root:
+
+```bash
+python stamps_python/prep_isce.py F:/QianWei/processing/stack/merged \
+  --output validation_runs/prep_isce_ps \
+  --range-patches 8 \
+  --azimuth-patches 2 \
+  --run-calamp \
+  --run-select \
+  --run-extract \
+  --phase-from-slcs \
+  --write-ps1
+```
+
+This command discovers co-registered SLCs from `SLC/YYYYMMDD/*.slc.full`, infers
+`width.txt`, `len.txt`, acquisition dates, master date, baselines, heading, and
+wavelength where available, extracts longitude/latitude/DEM/incidence angle from
+`geom_reference/`, and writes Python-compatible `PATCH_*/ps1.h5` inputs. If the
+master date cannot be inferred from the stack metadata, pass it explicitly with
+`--master-date YYYYMMDD`.
+
+Prepare existing ISCE2 small-baseline interferograms:
+
+```bash
+python stamps_python/prep_isce.py path/to/merged \
+  --output path/to/prepared_sb \
+  --small-baseline \
+  --run-calamp \
+  --run-select \
+  --run-extract \
+  --write-ps1
 ```
 
 Run StaMPS Steps 1-8:
@@ -141,8 +197,9 @@ python stamps_python/export_results.py \
 
 ## Important Notes
 
-- The Python workflow currently targets PS-InSAR. Small Baseline support is only
-  partially translated and should be treated as experimental/incomplete.
+- The Python workflow targets PS-InSAR and can prepare ISCE2 small-baseline
+  interferograms for the translated SB path. Full-chain SB validation should be
+  repeated for each new stack geometry before production use.
 - The project is designed around HDF5 outputs (`*.h5`) rather than MATLAB `.mat`
   files for the main Python path.
 - `snaphu` must be installed and available on `PATH`, or configured through the
