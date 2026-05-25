@@ -136,7 +136,7 @@ merged/
 Run preprocessing from the repository root:
 
 ```bash
-python stamps_python/prep_isce.py F:/QianWei/processing/stack/merged \
+python stamps_python/prep_isce.py path/to/merged \
   --output validation_runs/prep_isce_ps \
   --range-patches 8 \
   --azimuth-patches 2 \
@@ -153,6 +153,21 @@ wavelength where available, extracts longitude/latitude/DEM/incidence angle from
 `geom_reference/`, and writes Python-compatible `PATCH_*/ps1.h5` inputs. If the
 master date cannot be inferred from the stack metadata, pass it explicitly with
 `--master-date YYYYMMDD`.
+
+Example command matching the project full-stack validation run, assuming the
+ISCE2 `merged` directory has been placed under `test_data/merged`:
+
+```bash
+python stamps_python/prep_isce.py test_data/merged \
+  --output validation_runs/prep_isce_real_full_ps_8x2 \
+  --range-patches 8 \
+  --azimuth-patches 2 \
+  --run-calamp \
+  --run-select \
+  --run-extract \
+  --phase-from-slcs \
+  --write-ps1
+```
 
 Prepare existing ISCE2 small-baseline interferograms:
 
