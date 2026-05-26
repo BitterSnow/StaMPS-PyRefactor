@@ -1157,18 +1157,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("Project directory does not exist: %s", project_dir)
         return 1
 
-    # Check that parms.mat is reachable
-    parms_path = project_dir / "parms.mat"
-    if not parms_path.is_file():
-        # Maybe user pointed to a parent dir; check common layouts
-        candidates = list(project_dir.glob("parms.mat"))
-        if not candidates:
-            logger.error(
-                "parms.mat not found in %s. "
-                "Please specify a directory containing parms.mat via --config.",
-                project_dir,
-            )
-            return 1
+    # Check that Python-native or legacy MATLAB parms are reachable.
+    parm_candidates = [
+        project_dir / "parms.json",
+        project_dir / "parms.mat",
+        project_dir.parent / "parms.json",
+        project_dir.parent / "parms.mat",
+    ]
+    if not any(path.is_file() for path in parm_candidates):
+        logger.error(
+            "parms.json/parms.mat not found in %s or %s. "
+            "Please specify a directory containing a parameter file via --config.",
+            project_dir,
+            project_dir.parent,
+        )
+        return 1
 
     try:
         runner = StampsRunner(project_dir=project_dir)

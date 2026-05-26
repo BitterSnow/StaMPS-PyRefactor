@@ -47,6 +47,11 @@ validation runs are intentionally ignored by Git.
   Python-oriented outputs.
 - Patch preparation can produce Python-compatible HDF5 inputs and no longer
   depends on MATLAB `.mat` products for the main flow.
+- ISCE2 `merged` directories can now be used directly as preprocessing input.
+  The Python preprocessor can generate `day.1.in`, `master_day.1.in`,
+  `bperp.1.in`, `heading.1.in`, `lambda.1.in`, `parms.json`, and
+  `localparms.json` without creating or reading a MATLAB/StaMPS
+  `INSAR_YYYYMMDD` directory.
 - StaMPS PS workflow Steps 1-8 are implemented in Python:
   - Step 1: initial data loading
   - Step 2: gamma estimation
@@ -99,6 +104,18 @@ The exported GeoPackage test completed with:
 
 Generated validation outputs are not committed to Git because of size.
 
+The preprocessing bootstrap path has also been validated with a clean input
+view containing only:
+
+- `SLC/`
+- `geom_reference/`
+- `baselines/`
+- `input_file_YYYYMMDD`
+
+That validation intentionally excluded `INSAR_YYYYMMDD`, `parms.mat`, and
+`localparms.mat`. The generated Python metadata matched the native ISCE/StaMPS
+reference values for heading and perpendicular baseline.
+
 ## Basic Usage
 
 Install dependencies in a Python environment:
@@ -138,6 +155,8 @@ Run preprocessing from the repository root:
 ```bash
 python stamps_python/prep_isce.py path/to/merged \
   --output validation_runs/prep_isce_ps \
+  --reference-date 20200101 \
+  --bootstrap-metadata \
   --range-patches 8 \
   --azimuth-patches 2 \
   --da-thresh 0.4 \
@@ -148,13 +167,29 @@ python stamps_python/prep_isce.py path/to/merged \
   --write-ps1
 ```
 
-This command discovers co-registered SLCs from `SLC/YYYYMMDD/*.slc.full`, infers
-`width.txt`, `len.txt`, acquisition dates, master date, baselines, heading, and
-wavelength where available, extracts longitude/latitude/DEM/incidence angle from
-`geom_reference/`, and writes Python-compatible `PATCH_*/ps1.h5` inputs.
-`--da-thresh` controls the amplitude-dispersion threshold used during PS
-candidate selection; the default is `0.4`. If the master date cannot be inferred
-from the stack metadata, pass it explicitly with `--master-date YYYYMMDD`.
+This command discovers co-registered SLCs from `SLC/YYYYMMDD/*.slc.full`,
+infers `width.txt` and `len.txt`, reads the acquisition dates, computes
+perpendicular baselines from `baselines/YYYYMMDD/YYYYMMDD`, computes heading
+from `geom_reference/los.rdr.full`, reads wavelength from `input_file_*`, and
+extracts longitude/latitude/DEM/incidence angle from `geom_reference/`.
+`--bootstrap-metadata` writes Python-native `parms.json` and `localparms.json`
+alongside the StaMPS-style text metadata files. `--reference-date` should be
+passed explicitly for reproducible PS processing; `--master-date` remains as a
+backward-compatible alias. `--da-thresh` controls the amplitude-dispersion
+threshold used during PS candidate selection; the default is `0.4`.
+
+To only test metadata generation without running candidate selection or phase
+extraction:
+
+```bash
+python stamps_python/prep_isce.py path/to/merged \
+  --output validation_runs/prep_isce_metadata_probe \
+  --reference-date 20200101 \
+  --bootstrap-metadata \
+  --metadata-only \
+  --range-patches 8 \
+  --azimuth-patches 2
+```
 
 Example command matching the project full-stack validation run, assuming the
 ISCE2 `merged` directory has been placed under `test_data/merged`:
@@ -162,6 +197,8 @@ ISCE2 `merged` directory has been placed under `test_data/merged`:
 ```bash
 python stamps_python/prep_isce.py test_data/merged \
   --output validation_runs/prep_isce_real_full_ps_8x2 \
+  --reference-date 20250911 \
+  --bootstrap-metadata \
   --range-patches 8 \
   --azimuth-patches 2 \
   --da-thresh 0.4 \
@@ -218,8 +255,13 @@ python stamps_python/export_results.py \
 - The Python workflow targets PS-InSAR and can prepare ISCE2 small-baseline
   interferograms for the translated SB path. Full-chain SB validation should be
   repeated for each new stack geometry before production use.
-- The project is designed around HDF5 outputs (`*.h5`) rather than MATLAB `.mat`
-  files for the main Python path.
+- The project is designed around HDF5 outputs (`*.h5`) and JSON parameter files
+  (`parms.json`, `localparms.json`) rather than MATLAB `.mat` files for the main
+  Python path.
+- For the direct-`merged` PS workflow, the preprocessor does not require the
+  original `make_single_reference_stack_isce` output directory
+  (`INSAR_YYYYMMDD`). It uses `SLC/`, `geom_reference/`, `baselines/`, and
+  `input_file_*` directly.
 - `snaphu` must be installed and available on `PATH`, or configured through the
   StaMPS parameters, for Step 6 unwrapping.
 - Full processing can be CPU-, memory-, and disk-intensive. Generated products

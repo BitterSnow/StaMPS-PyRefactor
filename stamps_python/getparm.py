@@ -51,6 +51,7 @@ Original author: Andy Hooper, June 2006
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from pathlib import Path
@@ -108,6 +109,45 @@ def _convert_mat_value(val: Any) -> Any:
         if val.ndim == 2 and (val.shape[0] == 1 or val.shape[1] == 1):
             return val.flatten()
         return val
+    return val
+
+
+def _json_to_value(val: Any) -> Any:
+    """Convert JSON-friendly values to the runtime parameter representation."""
+    if isinstance(val, list):
+        if all(isinstance(item, (int, float, bool)) or item is None for item in val):
+            return np.asarray([_json_to_value(item) for item in val])
+        return [_json_to_value(item) for item in val]
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in {"inf", "+inf", "infinity", "+infinity"}:
+            return np.float64(np.inf)
+        if low in {"-inf", "-infinity"}:
+            return np.float64(-np.inf)
+        if low == "nan":
+            return np.float64(np.nan)
+    return val
+
+
+def _value_to_json(val: Any) -> Any:
+    """Convert numpy/MATLAB-style values to portable JSON values."""
+    if isinstance(val, np.ndarray):
+        return [_value_to_json(item) for item in val.tolist()]
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating, float)):
+        f = float(val)
+        if np.isnan(f):
+            return "nan"
+        if np.isposinf(f):
+            return "inf"
+        if np.isneginf(f):
+            return "-inf"
+        return f
+    if isinstance(val, (list, tuple)):
+        return [_value_to_json(item) for item in val]
+    if isinstance(val, dict):
+        return {str(k): _value_to_json(v) for k, v in sorted(val.items())}
     return val
 
 
@@ -274,7 +314,7 @@ class StampsConfig:
         self._local_parms: Dict[str, Any] = {}
         self._parm_file: Optional[Path] = None
         self._local_parm_file: Optional[Path] = None
-        self._parent_flag: bool = False  # True when parms.mat is in parent dir
+        self._parent_flag: bool = False  # True when parms file is in parent dir
         self._loaded: bool = False
         self._initialized = True
 
@@ -288,15 +328,22 @@ class StampsConfig:
             cls._instance = None
 
     # ------------------------------------------------------------------
-    # Load parms.mat / localparms.mat
+    # Load parms.json/parms.mat and local overrides
     # ------------------------------------------------------------------
     def load(self, work_dir: Optional[Union[str, Path]] = None) -> None:
-        """Load ``parms.mat`` and ``localparms.mat`` from work_dir.
+        """Load StaMPS parameters from work_dir.
 
-        Search order matches MATLAB getparm.m lines 23–30:
-        1. ``./parms.mat``
-        2. ``../parms.mat``
-        Raises ``FileNotFoundError`` if neither exists.
+        Python-native JSON is preferred; MATLAB ``.mat`` files are kept as a
+        compatibility fallback.
+
+        Search order:
+        1. ``./parms.json``
+        2. ``./parms.mat``
+        3. ``../parms.json``
+        4. ``../parms.mat``
+
+        Local overrides use the same rule in the working directory:
+        ``localparms.json`` first, then ``localparms.mat``.
 
         MATLAB correspondence
         --------------------
@@ -316,37 +363,41 @@ class StampsConfig:
 
         wd = self._work_dir
 
-        # ---------- Locate parms.mat ----------
-        # MATLAB getparm.m lines 23-30
-        parm_path = wd / "parms.mat"
-        if parm_path.is_file():
-            self._parm_file = parm_path
-            self._parent_flag = False
+        # ---------- Locate parms file ----------
+        candidates = [
+            (wd / "parms.json", False),
+            (wd / "parms.mat", False),
+            (wd.parent / "parms.json", True),
+            (wd.parent / "parms.mat", True),
+        ]
+        for candidate, parent_flag in candidates:
+            if candidate.is_file():
+                self._parm_file = candidate
+                self._parent_flag = parent_flag
+                break
         else:
-            parent_path = wd.parent / "parms.mat"
-            if parent_path.is_file():
-                self._parm_file = parent_path
-                self._parent_flag = True
-            else:
-                raise FileNotFoundError(
-                    f"parms.mat not found in {wd} or {wd.parent}"
-                )
+            raise FileNotFoundError(
+                f"parms.json/parms.mat not found in {wd} or {wd.parent}"
+            )
 
         logger.info("Loading parms from: %s", self._parm_file)
-        data = self._load_mat_as_dict(self._parm_file)
+        data = self._load_parm_file_as_dict(self._parm_file)
         # If file has a single top-level variable that is a struct (dict), use it as parms
         if len(data) == 1 and isinstance(next(iter(data.values())), dict):
             self._parms = next(iter(data.values()))
         else:
             self._parms = data
 
-        # ---------- Locate localparms.mat ----------
-        # MATLAB getparm.m lines 32-36
-        local_path = wd / "localparms.mat"
-        if local_path.is_file():
+        # ---------- Locate local overrides ----------
+        local_path = None
+        for candidate in [wd / "localparms.json", wd / "localparms.mat"]:
+            if candidate.is_file():
+                local_path = candidate
+                break
+        if local_path is not None:
             logger.info("Loading local parms from: %s", local_path)
             self._local_parm_file = local_path
-            data_local = self._load_mat_as_dict(local_path)
+            data_local = self._load_parm_file_as_dict(local_path)
             if len(data_local) == 1 and isinstance(next(iter(data_local.values())), dict):
                 self._local_parms = next(iter(data_local.values()))
             else:
@@ -366,8 +417,25 @@ class StampsConfig:
         )
 
     # ------------------------------------------------------------------
-    # Read .mat files (v4/v5/v6/v7 and v7.3 HDF5)
+    # Read parameter files
     # ------------------------------------------------------------------
+    @staticmethod
+    def _load_parm_file_as_dict(path: Path) -> Dict[str, Any]:
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            return StampsConfig._load_json_as_dict(path)
+        if suffix == ".mat":
+            return StampsConfig._load_mat_as_dict(path)
+        raise ValueError(f"Unsupported parameter file format: {path}")
+
+    @staticmethod
+    def _load_json_as_dict(json_path: Path) -> Dict[str, Any]:
+        with json_path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            raise ValueError(f"{json_path} must contain a JSON object")
+        return {str(k): _json_to_value(v) for k, v in raw.items()}
+
     @staticmethod
     def _load_mat_as_dict(mat_path: Path) -> Dict[str, Any]:
         """Load a .mat file and convert to a Python dict.
@@ -805,6 +873,31 @@ class StampsConfig:
         merged = dict(self._parms)
         merged.update(self._local_parms)
         return dict(sorted(merged.items()))
+
+    def write_json(
+        self,
+        path: Union[str, Path],
+        include_local: bool = False,
+    ) -> None:
+        """Write parameters to a Python-native JSON parameter file.
+
+        Parameters
+        ----------
+        path
+            Destination path, usually ``parms.json`` or ``localparms.json``.
+        include_local
+            When true, write the effective merged parameter set.  When false,
+            write only the base ``parms`` dictionary.
+        """
+        if not self._loaded:
+            self.load()
+        data = self.get_all_parms() if include_local else dict(self._parms)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(_value_to_json(data), fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        logger.info("Wrote JSON parms: %s", path)
 
     def __repr__(self) -> str:
         status = "loaded" if self._loaded else "not loaded"

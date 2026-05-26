@@ -1239,24 +1239,13 @@ class ISCESBLoader(ISCEPSLoader):
         # Radar coordinates
         ij_path = self._resolve("ij")
         ij = np.loadtxt(str(ij_path), dtype=np.int32)
-        self.n_ps = ij.shape[0]
+        n_ps_raw = ij.shape[0]
+        self.n_ps = n_ps_raw
         logger.info("PS candidates: n_ps=%d", self.n_ps)
 
-        # Amplitude calibration
-        calamp_path = self._resolve_optional("calamp")
-        if calamp_path is not None:
-            self.calconst = self._parse_calamp(calamp_path, self._master_yyyymmdd)
-            # SB mode: calconst length should match n_ifg (not n_ifg-1)
-            if len(self.calconst) != self.n_ifg:
-                logger.warning(
-                    "calamp.out produced %d constants, expected %d; "
-                    "falling back to ones",
-                    len(self.calconst),
-                    self.n_ifg,
-                )
-                self.calconst = np.ones(self.n_ifg, dtype=np.float64)
-        else:
-            self.calconst = np.ones(self.n_ifg, dtype=np.float64)
+        # SB calamp.out contains paired SLC calibration rows for candidate
+        # selection. The loaded wrapped IFG phase is normalized below instead.
+        self.calconst = np.ones(self.n_ifg, dtype=np.float64)
         logger.info(
             "Calibration constants: %d values loaded", len(self.calconst)
         )
@@ -1264,7 +1253,7 @@ class ISCESBLoader(ISCEPSLoader):
         # Complex phase (n_ifg columns in SB mode)
         ph_path = self._resolve("ph")
         actual_bytes = ph_path.stat().st_size
-        actual_cols = actual_bytes // (self.n_ps * 8)
+        actual_cols = actual_bytes // (n_ps_raw * 8)
         if actual_cols != self.n_ifg:
             logger.warning(
                 "Phase file has %d columns, expected %d for SB mode. "
@@ -1276,22 +1265,29 @@ class ISCESBLoader(ISCEPSLoader):
         else:
             n_ifg_actual = self.n_ifg
 
-        ph = self._read_complex_phase(ph_path, self.n_ps, n_ifg_actual)
+        ph = self._read_complex_phase(ph_path, n_ps_raw, n_ifg_actual)
 
-        # Drop PS where more than 1 phase is zero
+        # Drop PS where more than 1 phase is zero, matching sb_load_initial_isce.
         zero_ph = np.sum(ph == 0, axis=1)
         nonzero_ix = zero_ph <= 1
+        if not np.all(nonzero_ix):
+            dropped = int(np.size(nonzero_ix) - np.count_nonzero(nonzero_ix))
+            logger.info("Dropping %d SB candidates with more than one zero phase", dropped)
+        ph = ph[nonzero_ix]
+        ij = ij[nonzero_ix]
+        self.n_ps = int(ph.shape[0])
 
-        # Scale by calibration constants
-        if n_ifg_actual == len(self.calconst):
-            ph = ph / self.calconst[np.newaxis, :]
+        # SB mode stores wrapped phase only; normalize non-zero complex samples.
+        nonzero_phase = ph != 0
+        ph[nonzero_phase] = ph[nonzero_phase] / np.abs(ph[nonzero_phase])
 
         self.ph = ph
         logger.info("Phase loaded: shape=%s, dtype=%s", self.ph.shape, self.ph.dtype)
 
         # Lon/Lat → local XY
         ll_path = self._resolve("ll")
-        lonlat = self._read_lonlat(ll_path, self.n_ps).astype(np.float64)
+        lonlat = self._read_lonlat(ll_path, n_ps_raw).astype(np.float64)
+        lonlat = lonlat[nonzero_ix]
         self.ll0 = (lonlat.max(axis=0) + lonlat.min(axis=0)) / 2.0
 
         xy = self._llh2local(lonlat, self.ll0) * 1000.0
