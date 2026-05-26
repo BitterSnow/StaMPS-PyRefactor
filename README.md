@@ -80,13 +80,8 @@ validation runs are intentionally ignored by Git.
 
 ## Current Validation Status
 
-The latest full-chain validation used the project directory:
-
-```text
-validation_runs/prep_isce_real_full_ps_8x2
-```
-
-The run completed through Step 8 with merged outputs including:
+The PS-InSAR workflow has been run through Step 8 on a real ISCE2 SLC stack.
+The validated merged outputs include:
 
 - `ps2.h5`
 - `ph2.h5`
@@ -102,7 +97,8 @@ The exported GeoPackage test completed with:
 - `vel` plus 45 date fields
 - default correction `v-dso`: SCLA + SCN correction followed by deramp
 
-Generated validation outputs are not committed to Git because of size.
+Validation datasets and generated outputs are not committed to Git because of
+size and because each user will have their own ISCE/StaMPS project layout.
 
 The preprocessing bootstrap path has also been validated with a clean input
 view containing only:
@@ -191,12 +187,12 @@ python stamps_python/prep_isce.py path/to/merged \
   --azimuth-patches 2
 ```
 
-Example command matching the project full-stack validation run, assuming the
-ISCE2 `merged` directory has been placed under `test_data/merged`:
+Example command matching the project full-stack validation settings, using
+relative paths:
 
 ```bash
-python stamps_python/prep_isce.py test_data/merged \
-  --output validation_runs/prep_isce_real_full_ps_8x2 \
+python stamps_python/prep_isce.py data/isce2_stack/merged \
+  --output runs/prep_isce_ps_8x2 \
   --reference-date 20250911 \
   --bootstrap-metadata \
   --range-patches 8 \
