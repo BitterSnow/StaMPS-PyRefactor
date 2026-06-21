@@ -291,6 +291,37 @@ class UnwrapPipeline:
         scla_subtracted = False
         ramp_subtracted = False
 
+        # Match ps_unwrap.m: derive the look-angle search width from the
+        # actual baseline span and incidence angle instead of using uw_3d's
+        # generic default of six wraps.
+        inc_mean = np.deg2rad(21.0)
+        inc_path = self.patch_dir / f"inc{v}.h5"
+        la_path = self.patch_dir / f"la{v}.h5"
+        if inc_path.is_file():
+            with h5py.File(str(inc_path), "r") as hf:
+                inc = np.asarray(hf["inc"], dtype=np.float64).ravel()
+            valid_inc = inc[np.isfinite(inc) & (inc != 0)]
+            if valid_inc.size:
+                inc_mean = float(np.mean(valid_inc))
+        elif la_path.is_file():
+            with h5py.File(str(la_path), "r") as hf:
+                la = np.asarray(hf["la"], dtype=np.float64).ravel()
+            valid_la = la[np.isfinite(la)]
+            if valid_la.size:
+                inc_mean = float(np.mean(valid_la)) + 0.052
+
+        wavelength = float(self._cfg.getparm("lambda"))
+        max_topo_err = float(self._cfg.getparm("max_topo_err"))
+        bperp_range = float(np.ptp(np.asarray(ps["bperp"], dtype=np.float64)))
+        denom = wavelength * 830000.0 * np.sin(inc_mean) / (4.0 * np.pi)
+        max_k = max_topo_err / denom if np.isfinite(denom) and denom > 0 else 0.0
+        n_trial_wraps = bperp_range * max_k / (2.0 * np.pi)
+        logger.info(
+            "Look-angle search: incidence=%.3f deg, n_trial_wraps=%.6f",
+            np.rad2deg(inc_mean),
+            n_trial_wraps,
+        )
+
         # ---- Options for uw_3d ----
         options = {
             "master_day": ps["master_day"],
@@ -302,6 +333,7 @@ class UnwrapPipeline:
             "gold_alpha": self._cfg.getparm("unwrap_gold_alpha"),
             "la_flag": self._cfg.getparm("unwrap_la_error_flag"),
             "scf_flag": self._cfg.getparm("unwrap_spatial_cost_func_flag"),
+            "n_trial_wraps": n_trial_wraps,
         }
         # Defaults if not in parms
         if options["time_win"] is None:
@@ -424,7 +456,22 @@ class UnwrapPipeline:
         time_win = float(options.get("time_win", 730))
         unwrap_method = str(options.get("unwrap_method", "3D_QUICK")).strip()
         la_flag = str(options.get("la_flag", "y")).strip().lower()
-        n_trial_wraps = 6.0
+        n_trial_wraps = float(options.get("n_trial_wraps", 6.0))
+        day_1d = np.asarray(day).ravel()
+        ifgday_ix_0 = np.asarray(ifgday_ix, dtype=np.int32)
+        if ifgday_ix_0.ndim == 1:
+            ifgday_ix_0 = np.column_stack([np.arange(n_ifg), np.arange(1, n_ifg + 1)])
+        if np.any(ifgday_ix_0 >= 1):
+            ifgday_ix_0 = (ifgday_ix_0 - 1).clip(0, day_1d.size - 1)
+
+        # MATLAB uw_3d promotes a single-master 3D run to 3D_FULL. This is
+        # essential for retaining large, temporally coherent deformation.
+        if unwrap_method.upper() in {"3D", "3D_NEW"}:
+            if np.unique(ifgday_ix_0[:, 0]).size == 1:
+                unwrap_method = "3D_FULL"
+            else:
+                lowfilt_flag = "y"
+
         uw = uw_grid_wrapped(
             ph,
             xy,
@@ -436,12 +483,6 @@ class UnwrapPipeline:
             ph_in_predef=None,
         )
         ui = uw_interp(uw)
-        day_1d = np.asarray(day).ravel()
-        ifgday_ix_0 = np.asarray(ifgday_ix, dtype=np.int32)
-        if ifgday_ix_0.ndim == 1:
-            ifgday_ix_0 = np.column_stack([np.arange(n_ifg), np.arange(1, n_ifg + 1)])
-        if np.any(ifgday_ix_0 >= 1):
-            ifgday_ix_0 = (ifgday_ix_0 - 1).clip(0, day_1d.size - 1)
         bperp_1d = np.asarray(bperp, dtype=np.float32).ravel()
         ut = uw_sb_unwrap_space_time(
             uw,

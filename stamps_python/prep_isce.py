@@ -1500,7 +1500,7 @@ def extract_phase_from_slcs(
     precision: str = "f",
     byteswap: bool = False,
 ) -> np.ndarray:
-    """Write PS wrapped phase as slave * conj(master) samples from co-registered SLCs."""
+    """Write PS wrapped phase as master * conj(slave) from co-registered SLCs."""
     dated_slcs = [(date, path) for path in slcs if (date := _slc_date(path)) is not None]
     dated_slcs.sort(key=lambda item: item[0])
     master_matches = [path for date, path in dated_slcs if date == master_date]
@@ -1543,7 +1543,6 @@ def extract_phase_from_slcs(
                     scalar_dtype=scalar_dtype,
                 )
                 master_samples = master_line[x_rel]
-                conj_master = np.conj(master_samples)
                 for i, slave_fh in enumerate(slave_handles):
                     slave_line = _read_complex_window(
                         slave_fh,
@@ -1553,7 +1552,9 @@ def extract_phase_from_slcs(
                         count=count,
                         scalar_dtype=scalar_dtype,
                     )
-                    ph[i, cand_ix] = slave_line[x_rel] * conj_master
+                    # ISCE make_single_reference_stack_isce uses
+                    # imageMath: reference * conj(secondary).
+                    ph[i, cand_ix] = master_samples * np.conj(slave_line[x_rel])
         finally:
             for fh in slave_handles:
                 fh.close()

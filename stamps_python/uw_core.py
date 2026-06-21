@@ -78,54 +78,66 @@ def wrap_filt(
     ph = np.nan_to_num(ph, nan=0.0, copy=True)
     ph_out = np.zeros_like(ph, dtype=np.complex128)
     ph_out_low = np.zeros_like(ph, dtype=np.complex128) if low_flag == "y" else None
-    # Small Gaussian for smoothing magnitude
+
+    # MATLAB gausswin(N, alpha) has std=(N-1)/(2*alpha).
     from scipy.signal.windows import gaussian as gaussian_win
-    B = np.outer(gaussian_win(7, 1.5), gaussian_win(7, 1.5))
-    B /= B.sum()
-    L = np.fft.ifftshift(
-        np.outer(gaussian_win(n_win + n_pad, 2), gaussian_win(n_win + n_pad, 2))
-    )
-    L = L / (np.abs(L) + 1e-12)
+
+    smooth_win = gaussian_win(7, (7 - 1) / (2 * 2.5))
+    B = np.outer(smooth_win, smooth_win)
+    low_std = (n_win + n_pad - 1) / (2 * 16)
+    low_win = gaussian_win(n_win + n_pad, low_std)
+    L = np.fft.ifftshift(np.outer(low_win, low_win))
+
     x = np.arange(1, n_win // 2 + 1, dtype=np.float64)
     X, Y = np.meshgrid(x, x)
     wind_func = X + Y
     wind_func = np.hstack([wind_func, np.fliplr(wind_func)])
     wind_func = np.vstack([wind_func, np.flipud(wind_func)])
+
+    from scipy.signal import convolve2d
+
     for ix1 in range(n_win_i):
+        wf = wind_func
+        i1 = ix1 * n_inc
+        i2 = i1 + n_win
+        if i2 > n_i:
+            i_shift = i2 - n_i
+            i2 = n_i
+            i1 = n_i - n_win
+            wf = np.vstack([np.zeros((i_shift, n_win)), wf[: n_win - i_shift, :]])
         for ix2 in range(n_win_j):
-            i1 = ix1 * n_inc
+            wf2 = wf
             j1 = ix2 * n_inc
-            i2 = min(i1 + n_win, n_i)
-            j2 = min(j1 + n_win, n_j)
-            i1 = i2 - n_win
-            j1 = j2 - n_win
-            i1 = max(0, i1)
-            j1 = max(0, j1)
+            j2 = j1 + n_win
+            if j2 > n_j:
+                j_shift = j2 - n_j
+                j2 = n_j
+                j1 = n_j - n_win
+                wf2 = np.hstack([np.zeros((n_win, j_shift)), wf2[:, : n_win - j_shift]])
+
             ph_bit = np.zeros((n_win + n_pad, n_win + n_pad), dtype=np.complex128)
             ph_bit[:n_win, :n_win] = ph[i1:i2, j1:j2]
             ph_fft = np.fft.fft2(ph_bit)
             H = np.abs(ph_fft)
-            from scipy.ndimage import convolve
-            H = np.fft.ifftshift(convolve(np.fft.fftshift(H), B, mode="constant", cval=0))
+            H = np.fft.ifftshift(
+                convolve2d(np.fft.fftshift(H), B, mode="same", boundary="fill", fillvalue=0)
+            )
             meanH = np.median(H)
             if meanH != 0:
                 H = H / meanH
-            H = np.power(H + 1e-12, alpha)
-            ph_filt = np.fft.ifft2(ph_fft * H).real
-            wf2 = wind_func[: i2 - i1, : j2 - j1] if wind_func.shape[0] >= (i2 - i1) else 1.0
-            if np.isscalar(wf2):
-                wf2 = np.ones((i2 - i1, j2 - j1))
-            ph_out[i1:i2, j1:j2] += ph_filt[: i2 - i1, : j2 - j1] * wf2
+            H = np.power(H, alpha)
+
+            ph_filt = np.fft.ifft2(ph_fft * H)
+            ph_out[i1:i2, j1:j2] += ph_filt[:n_win, :n_win] * wf2
             if low_flag == "y" and ph_out_low is not None:
-                ph_filt_low = np.fft.ifft2(ph_fft * L).real
-                ph_out_low[i1:i2, j1:j2] += ph_filt_low[: i2 - i1, : j2 - j1] * wf2
+                ph_filt_low = np.fft.ifft2(ph_fft * L)
+                ph_out_low[i1:i2, j1:j2] += ph_filt_low[:n_win, :n_win] * wf2
+
     mag = np.abs(ph)
     ph_out = mag * np.exp(1j * np.angle(ph_out))
     if ph_out_low is not None:
         ph_out_low = mag * np.exp(1j * np.angle(ph_out_low))
     return np.asarray(ph_out, dtype=np.complex64), ph_out_low
-
-
 # ---------------------------------------------------------------------------
 # uw_grid_wrapped — resample to grid, optional filter (MATLAB uw_grid_wrapped.m)
 # ---------------------------------------------------------------------------
@@ -183,14 +195,20 @@ def uw_grid_wrapped(
     else:
         grid_x_min = float(xy_in[:, 1].min())
         grid_y_min = float(xy_in[:, 2].min())
-        grid_ij = np.column_stack([
+        # MATLAB builds these as 1-based indices, folds the last boundary
+        # cell into the preceding cell, then allocates exactly max(index)
+        # rows/columns. Convert to 0-based only after that operation.
+        grid_ij_1 = np.column_stack([
             np.ceil((xy_in[:, 2] - grid_y_min + 1e-3) / pix_size).astype(np.int32),
             np.ceil((xy_in[:, 1] - grid_x_min + 1e-3) / pix_size).astype(np.int32),
         ])
-        grid_ij[:, 0] = np.clip(grid_ij[:, 0], 0, grid_ij[:, 0].max() - 1)
-        grid_ij[:, 1] = np.clip(grid_ij[:, 1], 0, grid_ij[:, 1].max() - 1)
-        n_i = int(grid_ij[:, 0].max()) + 1
-        n_j = int(grid_ij[:, 1].max()) + 1
+        for axis in (0, 1):
+            max_ix = int(grid_ij_1[:, axis].max())
+            if max_ix > 1:
+                grid_ij_1[grid_ij_1[:, axis] == max_ix, axis] = max_ix - 1
+        n_i = max(1, int(grid_ij_1[:, 0].max()))
+        n_j = max(1, int(grid_ij_1[:, 1].max()))
+        grid_ij = grid_ij_1 - 1
     prefilt_win = min(prefilt_win, n_i, n_j)
     if prefilt_win < 2:
         prefilt_win = 2
@@ -225,17 +243,18 @@ def uw_grid_wrapped(
                 np.asarray(ph_grid, dtype=np.complex64), prefilt_win, gold_alpha, lowfilt_flag
             )
             if lowfilt_flag == "y" and ph_lowpass is not None:
-                ph_lowpass[:, i1] = ph_this_low[nzix].ravel()
+                ph_lowpass[:, i1] = ph_this_low.ravel(order="F")[nzix.ravel(order="F")]
             if goldfilt_flag == "y":
-                ph[:, i1] = ph_this_gold[nzix].ravel()
+                ph[:, i1] = ph_this_gold.ravel(order="F")[nzix.ravel(order="F")]
             else:
-                ph[:, i1] = ph_grid[nzix].ravel()
+                ph[:, i1] = ph_grid.ravel(order="F")[nzix.ravel(order="F")]
         else:
-            ph[:, i1] = ph_grid[nzix].ravel()
+            ph[:, i1] = ph_grid.ravel(order="F")[nzix.ravel(order="F")]
     n_ps_orig = ph_in.shape[0]
     n_ps_grid = int(nzix.sum())
     logger.info("   Number of resampled points: %d", n_ps_grid)
-    nz_i, nz_j = np.where(nzix)
+    nz_flat = np.flatnonzero(nzix.ravel(order="F"))
+    nz_i, nz_j = np.unravel_index(nz_flat, nzix.shape, order="F")
     if pix_size == 0:
         xy = xy_in
     else:
@@ -282,7 +301,8 @@ def uw_interp(uw: UwGrid) -> UwInterp:
     """Build triangulation and grid→node mapping. Uses Delaunay (no triangle binary)."""
     logger.info("Interpolating grid...")
     nrow, ncol = uw.nzix.shape
-    y, x = np.where(uw.nzix)
+    node_flat = np.flatnonzero(uw.nzix.ravel(order="F"))
+    y, x = np.unravel_index(node_flat, uw.nzix.shape, order="F")
     xy = np.column_stack([np.arange(1, uw.n_ps + 1), x + 1, y + 1]).astype(np.float64)
     tri = Delaunay(xy[:, 1:3])
     simplices = tri.simplices
@@ -303,37 +323,38 @@ def uw_interp(uw: UwGrid) -> UwInterp:
     query = np.column_stack([XX.ravel(), YY.ravel()])
     _, Z_flat = tree.query(query, k=1)
     Z = (Z_flat + 1).reshape(nrow, ncol).astype(np.int32)
-    Zvec = Z.ravel()
-    n_row_edges = (nrow - 1) * ncol
-    grid_edges_row = np.column_stack([Zvec[: -nrow], Zvec[nrow:]])
-    Zvec_col = Z.T.ravel()
+    # MATLAB's Z(:) is column-major. Build horizontal (col) and vertical
+    # (row) edges explicitly so this does not depend on NumPy flatten order.
+    grid_edges_col = np.column_stack([
+        Z[:, :-1].ravel(order="F"),
+        Z[:, 1:].ravel(order="F"),
+    ])
+    grid_edges_row = np.column_stack([
+        Z[:-1, :].ravel(order="C"),
+        Z[1:, :].ravel(order="C"),
+    ])
+    grid_edges = np.vstack([grid_edges_col, grid_edges_row])
+    sorted_edges = np.sort(grid_edges, axis=1)
+    edge_sign = np.where(
+        grid_edges[:, 0] == grid_edges[:, 1],
+        0,
+        np.where(grid_edges[:, 0] < grid_edges[:, 1], 1, -1),
+    )
+    normalized = sorted_edges.copy()
+    normalized[normalized[:, 0] == normalized[:, 1], :] = 0
+    unique_edges, inverse = np.unique(normalized, axis=0, return_inverse=True)
+    nonzero = np.any(unique_edges != 0, axis=1)
+    edge_number = np.zeros(unique_edges.shape[0], dtype=np.int32)
+    edge_number[nonzero] = np.arange(1, np.count_nonzero(nonzero) + 1)
+    edgs_nonzero = unique_edges[nonzero]
+    edgs_final = np.column_stack([
+        np.arange(1, edgs_nonzero.shape[0] + 1, dtype=np.int32),
+        edgs_nonzero,
+    ])
+    grid_edge_ix = edge_number[inverse] * edge_sign
     n_col_edges = nrow * (ncol - 1)
-    grid_edges_col = np.column_stack([Zvec_col[: -ncol], Zvec_col[ncol:]])
-    sort_row = np.sort(grid_edges_row, axis=1)
-    sort_col = np.sort(grid_edges_col, axis=1)
-    edge_sign_row = np.sign(grid_edges_row[:, 1] - grid_edges_row[:, 0])
-    edge_sign_col = np.sign(grid_edges_col[:, 1] - grid_edges_col[:, 0])
-    all_edges = np.vstack([sort_row, sort_col])
-    edge_sign = np.concatenate([edge_sign_row, edge_sign_col])
-    same_ix = all_edges[:, 0] == all_edges[:, 1]
-    all_edges[same_ix] = 0
-    unq, inv = np.unique(all_edges, axis=0, return_inverse=True)
-    zero_row = np.all(unq == 0, axis=1)
-    unq = unq[~zero_row]
-    edge_id = np.arange(1, len(unq) + 1)
-    edgs_final = np.column_stack([edge_id, unq[:, 0], unq[:, 1]])
-    inv = inv.copy()
-    for i in range(len(zero_row)):
-        if zero_row[i]:
-            inv[inv == i] = -1
-    mask = inv >= 0
-    new_inv = np.full(inv.shape, -1)
-    idx = np.where(~zero_row)[0]
-    for i, old_i in enumerate(idx):
-        new_inv[inv == old_i] = i
-    grid_edge_ix = (new_inv + 1) * np.where(mask, edge_sign, 0)
-    rowix = grid_edge_ix[:n_row_edges].reshape(nrow - 1, ncol)
-    colix = grid_edge_ix[n_row_edges : n_row_edges + n_col_edges].reshape(nrow, ncol - 1)
+    colix = grid_edge_ix[:n_col_edges].reshape(nrow, ncol - 1, order="F")
+    rowix = grid_edge_ix[n_col_edges:].reshape(nrow - 1, ncol, order="C")
     n_edge = len(edgs_final)
     logger.info("   Number of unique edges in grid: %d", n_edge)
     return UwInterp(
@@ -396,44 +417,179 @@ def uw_sb_unwrap_space_time(
     n_image = day.size
     G = _build_G(n_ifg, n_image, ifgday_ix)
     nzc_ix = np.sum(np.abs(G), axis=0) != 0
+    col_map = np.full(nzc_ix.size, -1, dtype=np.int32)
+    col_map[nzc_ix] = np.arange(np.count_nonzero(nzc_ix), dtype=np.int32)
+    ifgday_ix = col_map[np.asarray(ifgday_ix, dtype=np.int32)]
     day = day[nzc_ix]
     G = G[:, nzc_ix]
     n = G.shape[1]
-    ifgday_ix = ifgday_ix.copy()
     K = np.zeros(ui.n_edge, dtype=np.float32)
     Kt = np.zeros(ui.n_edge, dtype=np.float32)
     if la_flag == "y" and bperp.size >= 2:
         bperp_range = float(np.max(bperp) - np.min(bperp))
-        if bperp_range > 0:
+        dph_sub = dph_space
+        bperp_sub = np.asarray(bperp, dtype=np.float64)
+        trial_wraps = float(n_trial_wraps)
+
+        sequential = np.flatnonzero(np.abs(np.diff(ifgday_ix, axis=1).ravel()) == 1)
+        if sequential.size >= day.size - 1:
+            dph_sub = dph_space[:, sequential]
+            bperp_sub = bperp_sub[sequential]
+        else:
+            ifgs_per_image = np.sum(np.abs(G), axis=0)
+            max_image = int(np.argmax(ifgs_per_image))
+            if int(ifgs_per_image[max_image]) >= day.size - 2:
+                use_ifg = G[:, max_image] != 0
+                gsub = G[use_ifg, max_image]
+                sign_ix = -np.sign(gsub)
+                dph_chain = dph_space[:, use_ifg].copy()
+                dph_chain[:, sign_ix == -1] = np.conj(dph_chain[:, sign_ix == -1])
+                bp_chain = np.asarray(bperp[use_ifg], dtype=np.float64)
+                bp_chain[sign_ix == -1] *= -1
+                other_image = np.sum(ifgday_ix[use_ifg, :], axis=1) - max_image
+                chain_images = np.concatenate([other_image, [max_image]])
+                sort_ix = np.argsort(day[chain_images])
+                dph_chain = np.column_stack([
+                    dph_chain,
+                    np.mean(np.abs(dph_chain), axis=1),
+                ])[:, sort_ix]
+                bp_chain = np.concatenate([bp_chain, [0.0]])[sort_ix]
+                dph_sub = dph_chain[:, 1:] * np.conj(dph_chain[:, :-1])
+                dph_sub /= np.abs(dph_sub) + 1e-12
+                bperp_sub = np.diff(bp_chain)
+
+        bperp_range_sub = float(np.max(bperp_sub) - np.min(bperp_sub))
+        if bperp_range > 0 and bperp_range_sub > 0:
+            trial_wraps *= bperp_range_sub / bperp_range
+            if not np.isfinite(trial_wraps):
+                trial_wraps = 6.0
             trial_mult = np.arange(
-                -int(np.ceil(8 * n_trial_wraps)),
-                int(np.ceil(8 * n_trial_wraps)) + 1,
+                -int(np.ceil(8 * trial_wraps)),
+                int(np.ceil(8 * trial_wraps)) + 1,
                 dtype=np.float64,
             )
-            trial_phase = bperp / bperp_range * (np.pi / 4)
+            trial_phase = bperp_sub / bperp_range_sub * (np.pi / 4)
             trial_phase_mat = np.exp(-1j * np.outer(trial_phase, trial_mult))
-            for i in range(ui.n_edge):
-                cpx = dph_space[i, :].ravel()
-                phaser = trial_phase_mat * cpx[:, np.newaxis]
-                coh_trial = np.abs(phaser.sum(axis=0)) / (np.abs(cpx).sum() + 1e-12)
-                imax = np.argmax(coh_trial)
-                coh_max = coh_trial[imax]
-                coh_trial[max(0, imax - 1) : min(len(coh_trial), imax + 2)] = 0
-                if coh_max - np.max(coh_trial) > 0.1:
-                    K0 = np.pi / 4 / bperp_range * trial_mult[imax]
-                    res = np.angle(cpx * np.exp(-1j * K0 * bperp))
-                    w = np.abs(cpx) + 1e-12
-                    mopt = np.linalg.lstsq(
-                        (w * bperp).reshape(-1, 1), (w * res).reshape(-1, 1), rcond=None
-                    )[0].ravel()[0]
-                    K[i] = K0 + mopt
-            dph_space = dph_space * np.exp(-1j * K[:, np.newaxis] * bperp)
+            coh = np.zeros(ui.n_edge, dtype=np.float32)
+
+            for edge_i in range(ui.n_edge):
+                cpx = dph_sub[edge_i, :].ravel()
+                coh_trial = np.abs(np.sum(trial_phase_mat * cpx[:, None], axis=0))
+                coh_trial /= np.sum(np.abs(cpx)) + 1e-12
+                peak_i = int(np.argmax(coh_trial))
+                coh_max = float(coh_trial[peak_i])
+
+                falling = np.flatnonzero(np.diff(coh_trial[: peak_i + 1]) < 0)
+                peak_start = int(falling[-1] + 1) if falling.size else 0
+                rising = np.flatnonzero(np.diff(coh_trial[peak_i:]) > 0)
+                peak_end = int(rising[0] + peak_i) if rising.size else coh_trial.size - 1
+                other_peaks = coh_trial.copy()
+                other_peaks[peak_start : peak_end + 1] = 0
+
+                if coh_max - float(np.max(other_peaks)) > 0.1:
+                    K0 = np.pi / 4 / bperp_range_sub * trial_mult[peak_i]
+                    residual = cpx * np.exp(-1j * K0 * bperp_sub)
+                    offset = np.sum(residual)
+                    residual_angle = np.angle(residual * np.conj(offset))
+                    weight = np.abs(cpx)
+                    design = (weight * bperp_sub).reshape(-1, 1)
+                    target = (weight * residual_angle).reshape(-1, 1)
+                    correction = np.linalg.lstsq(design, target, rcond=None)[0][0, 0]
+                    K[edge_i] = K0 + correction
+                    phase_residual = cpx * np.exp(-1j * K[edge_i] * bperp_sub)
+                    coh[edge_i] = np.abs(np.sum(phase_residual)) / (
+                        np.sum(np.abs(phase_residual)) + 1e-12
+                    )
+            K[coh < 0.31] = 0
+            dph_space = dph_space * np.exp(-1j * K[:, None] * bperp)
     spread = np.zeros((ui.n_edge, n_ifg), dtype=np.float32)
     if unwrap_method == "2D":
         dph_space_uw = np.angle(dph_space)
         if la_flag == "y":
             dph_space_uw = dph_space_uw + K[:, np.newaxis] * bperp
         dph_noise = np.zeros_like(dph_space_uw) * np.nan
+    elif unwrap_method.upper() == "3D_FULL":
+        dph_smooth_ifg = np.full(dph_space.shape, np.nan, dtype=np.float32)
+        for image_i in range(n):
+            use_ifg = G[:, image_i] != 0
+            if np.count_nonzero(use_ifg) < n - 2:
+                continue
+
+            gsub = G[use_ifg, image_i]
+            dph_sub = dph_space[:, use_ifg].copy()
+            sign_ix = -np.sign(gsub).astype(np.float32)
+            dph_sub[:, sign_ix == -1] = np.conj(dph_sub[:, sign_ix == -1])
+            other_image = np.sum(ifgday_ix[use_ifg, :], axis=1) - image_i
+            sort_ix = np.argsort(day[other_image])
+            other_sorted = other_image[sort_ix]
+            ifg_sorted = np.flatnonzero(use_ifg)[sort_ix]
+            sign_sorted = sign_ix[sort_ix]
+            dph_sub = dph_sub[:, sort_ix]
+            dph_sub_angle = np.angle(dph_sub)
+            day_sub = day[other_sorted]
+            n_sub = day_sub.size
+            dph_smooth = np.empty((ui.n_edge, n_sub), dtype=np.complex64)
+
+            for date_i in range(n_sub):
+                time_diff = day_sub[date_i] - day_sub
+                weight = np.exp(-(time_diff ** 2) / (2 * time_win ** 2))
+                weight /= np.sum(weight)
+                dph_mean = dph_sub @ weight
+                mean_adj = np.angle(
+                    np.exp(1j * (dph_sub_angle - np.angle(dph_mean)[:, None]))
+                )
+                # A vector third argument to MATLAB lscov is a direct
+                # observation-weight vector. Nearby dates must carry more,
+                # not less, influence in this local linear fit.
+                ls_weight = weight
+                sw = float(np.sum(ls_weight))
+                sx = float(np.dot(ls_weight, time_diff))
+                sxx = float(np.dot(ls_weight, time_diff * time_diff))
+                denom = sw * sxx - sx * sx
+                sy = mean_adj @ ls_weight
+                if abs(denom) > 1e-12:
+                    sxy = mean_adj @ (ls_weight * time_diff)
+                    intercept = (sxx * sy - sx * sxy) / denom
+                else:
+                    intercept = sy / sw
+                dph_smooth[:, date_i] = dph_mean * np.exp(1j * intercept)
+
+            increments = np.angle(
+                dph_smooth[:, 1:] * np.conj(dph_smooth[:, :-1])
+            )
+            dph_smooth_uw = np.cumsum(
+                np.column_stack([np.angle(dph_smooth[:, 0]), increments]),
+                axis=1,
+            )
+            positive = np.flatnonzero(other_sorted - image_i > 0)
+            close_i = int(positive[0]) if positive.size else n_sub - 1
+            close_ix = [close_i - 1, close_i] if close_i > 0 else [close_i]
+            close_phase = np.mean(dph_smooth_uw[:, close_ix], axis=1)
+            dph_smooth_uw -= (
+                close_phase - np.angle(np.exp(1j * close_phase))
+            )[:, None]
+            candidate = dph_smooth_uw * sign_sorted[None, :]
+
+            already = ~np.isnan(dph_smooth_ifg[0, ifg_sorted])
+            keep = np.ones(n_sub, dtype=bool)
+            if np.any(already):
+                cols = ifg_sorted[already]
+                noise_old = np.std(
+                    np.angle(dph_space[:, cols] * np.exp(-1j * dph_smooth_ifg[:, cols])),
+                    axis=0, ddof=1,
+                )
+                noise_new = np.std(
+                    np.angle(dph_space[:, cols] * np.exp(-1j * candidate[:, already])),
+                    axis=0, ddof=1,
+                )
+                keep[np.flatnonzero(already)[noise_old < noise_new]] = False
+            dph_smooth_ifg[:, ifg_sorted[keep]] = candidate[:, keep]
+
+        dph_noise = np.angle(dph_space * np.exp(-1j * dph_smooth_ifg))
+        dph_noise[np.std(dph_noise, axis=1, ddof=1) > 1.2, :] = np.nan
+        dph_space_uw = dph_smooth_ifg + dph_noise
+        if la_flag == "y":
+            dph_space_uw = dph_space_uw + K[:, np.newaxis] * bperp
     else:
         x = (day - day[0]) * (n - 1) / (day[-1] - day[0] + 1e-12)
         lstsq_res = np.linalg.lstsq(G[:, 1:], np.angle(dph_space).T, rcond=None)[0]
@@ -497,6 +653,7 @@ def uw_stat_costs(
     work_dir: Path,
     snaphu_path: str,
     variance: Optional[np.ndarray] = None,
+    ifg_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Run Snaphu per IFG; return ph_uw (n_ps_grid, n_ifg), msd (n_ifg)."""
     import tempfile
@@ -508,7 +665,8 @@ def uw_stat_costs(
     colix = np.asarray(ui.colix, dtype=np.float64)
     # Grid dimensions from uw so cost matrices match the actual grid (nzix)
     nrow, ncol = uw.nzix.shape
-    y, x = np.where(uw.nzix)
+    node_flat = np.flatnonzero(uw.nzix.ravel(order="F"))
+    y, x = np.unravel_index(node_flat, uw.nzix.shape, order="F")
     Z = ui.Z
     grid_edges = np.concatenate([
         colix[np.abs(colix) > 0].ravel(),
@@ -530,11 +688,14 @@ def uw_stat_costs(
         sigsq_noise = sigsq_noise / 10
         dph_smooth = ut.dph_space_uw
     else:
+        # MATLAB std(dph_noise, 0, 2) uses sample standard deviation and
+        # propagates NaN. A NaN marks the complete edge as having no usable
+        # statistics; nanstd would incorrectly re-enable that edge.
         with np.errstate(invalid="ignore"):
-            sigsq_noise = (np.nanstd(ut.dph_noise, axis=1) / (2 * np.pi)) ** 2
-        sigsq_noise = np.nan_to_num(sigsq_noise, nan=1.0)
-        dph_smooth = ut.dph_space_uw - np.nan_to_num(ut.dph_noise, nan=0)
+            sigsq_noise = (np.std(ut.dph_noise, axis=1, ddof=1) / (2 * np.pi)) ** 2
+        dph_smooth = ut.dph_space_uw - ut.dph_noise
     nostats = np.isnan(sigsq_noise)
+    sigsq_noise = np.nan_to_num(sigsq_noise, nan=1.0)
     rowix = rowix.copy()
     colix = colix.copy()
     for i in np.where(nostats)[0]:
@@ -552,8 +713,8 @@ def uw_stat_costs(
     #   [:,3::4] = laycost   (MATLAB (:,4:4:end))
     rowcost[:, 2::4] = maxshort  # dzmax
     colcost[:, 2::4] = maxshort  # dzmax
-    lay_row = np.int16(np.isfinite(rowix) & (rowix != 0)) * (-1 - maxshort) + 1
-    lay_col = np.int16(np.isfinite(colix) & (colix != 0)) * (-1 - maxshort) + 1
+    lay_row = np.int16(np.isfinite(rowix)) * (-1 - maxshort) + 1
+    lay_col = np.int16(np.isfinite(colix)) * (-1 - maxshort) + 1
     ncr = rowcost[:, 3::4].shape[1]  # ncol for rowcost
     ncc = colcost[:, 3::4].shape[1]  # ncol-1 for colcost
     rowcost[:, 3::4] = lay_row[:, :ncr].astype(np.int16)  # laycost
@@ -569,9 +730,14 @@ def uw_stat_costs(
         f.write("STATCOSTMODE  DEFO\n")
         f.write("INFILEFORMAT  COMPLEX_DATA\n")
         f.write("OUTFILEFORMAT FLOAT_DATA\n")
-    for i1 in range(uw.n_ifg):
+    process_indices = (
+        np.arange(uw.n_ifg, dtype=np.int32)
+        if ifg_indices is None
+        else np.asarray(ifg_indices, dtype=np.int32).ravel()
+    )
+    for i1 in process_indices:
         logger.info("   Processing IFG %d of %d", i1 + 1, uw.n_ifg)
-        spread_i = np.zeros(ui.n_edge, dtype=np.float32)
+        spread_i = np.asarray(ut.spread[:, i1], dtype=np.float32)
         spread_int = np.int16(
             np.round((np.abs(spread_i) * nshortcycle ** 2) / 6 / costscale * n_edges).clip(0, 32767)
         )
@@ -579,8 +745,12 @@ def uw_stat_costs(
         offset_cycle = (
             np.angle(np.exp(1j * ut.dph_space_uw[:, i1])) - dph_smooth[:, i1]
         ) / (2 * np.pi)
-        eix_row = (np.abs(rowix).astype(np.int32) - 1).clip(0, ui.n_edge - 1)
-        eix_col = (np.abs(colix).astype(np.int32) - 1).clip(0, ui.n_edge - 1)
+        valid_row = np.isfinite(rowix) & (rowix != 0)
+        valid_col = np.isfinite(colix) & (colix != 0)
+        eix_row = np.zeros(rowix.shape, dtype=np.int32)
+        eix_col = np.zeros(colix.shape, dtype=np.int32)
+        eix_row[valid_row] = np.abs(rowix[valid_row]).astype(np.int32) - 1
+        eix_col[valid_col] = np.abs(colix[valid_col]).astype(np.int32) - 1
         offgrid_row = np.round(
             offset_cycle[eix_row] * np.sign(np.nan_to_num(rowix, nan=1)) * nshortcycle
         ).astype(np.int16)
@@ -594,9 +764,9 @@ def uw_stat_costs(
         rowcost[:, 0::4][:, :n_assign_r] = -offgrid_row[:, :n_assign_r]  # offset
         colcost[:, 0::4][:, :n_assign_c] = offgrid_col[:, :n_assign_c]    # offset
         rowstdgrid = np.ones_like(rowix, dtype=np.int16)
-        rowstdgrid[np.isfinite(rowix) & (rowix != 0)] = sigsqtot[eix_row[np.isfinite(rowix) & (rowix != 0)]]
+        rowstdgrid[valid_row] = sigsqtot[eix_row[valid_row]]
         colstdgrid = np.ones_like(colix, dtype=np.int16)
-        colstdgrid[np.isfinite(colix) & (colix != 0)] = sigsqtot[eix_col[np.isfinite(colix) & (colix != 0)]]
+        colstdgrid[valid_col] = sigsqtot[eix_col[valid_col]]
         rowcost[:, 1::4][:, :n_assign_r] = rowstdgrid[:, :n_assign_r]  # sigsq
         colcost[:, 1::4][:, :n_assign_c] = colstdgrid[:, :n_assign_c]  # sigsq
         cost_path = work_dir / "snaphu.costinfile"
@@ -604,8 +774,12 @@ def uw_stat_costs(
             # Row-major = MATLAB fwrite(rowcost','int16') (col-major of transpose)
             f.write(rowcost.astype(np.int16).tobytes(order='C'))
             f.write(colcost.astype(np.int16).tobytes(order='C'))
-        ifgw = np.zeros((nrow, ncol), dtype=np.complex64)
-        ifgw[uw.nzix] = uw.ph[:, i1]
+        # MATLAB uses reshape(uw.ph(Z,i1), nrow, ncol): every rectangular
+        # grid cell is populated from its nearest PS grid node. Leaving empty
+        # cells as zero removes residues and destroys the spatial unwrap.
+        ifgw = uw.ph[np.asarray(Z, dtype=np.int32) - 1, i1].astype(
+            np.complex64, copy=False
+        )
         in_path = work_dir / "snaphu.in"
         _writecpx(in_path, ifgw)
         out_path = work_dir / "snaphu.out"
