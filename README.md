@@ -36,7 +36,9 @@ validation runs are intentionally ignored by Git.
 
 | Script | Purpose |
 | --- | --- |
+| `stamps_python/define_sb_pairs.py` | Define SB pair graphs before patch preparation |
 | `stamps_python/prep_isce.py` | Read ISCE/ISCE2 stack products and prepare Python-compatible StaMPS patch data |
+| `stamps_python/build_sb_phase.py` | Build SB `PATCH_*/pscands.1.ph` from co-registered SLC pairs |
 | `stamps_python/stamps_main.py` | Run StaMPS Steps 1-8 |
 | `stamps_python/export_results.py` | Export velocity and displacement time series to GeoPackage or Shapefile |
 | `stamps_python/validate_outputs.py` | Helper checks for generated outputs |
@@ -48,9 +50,10 @@ validation runs are intentionally ignored by Git.
 - Patch preparation can produce Python-compatible HDF5 inputs and no longer
   depends on MATLAB `.mat` products for the main flow.
 - ISCE2 `merged` directories can now be used directly as preprocessing input.
-  The Python preprocessor can generate `day.1.in`, `master_day.1.in`,
-  `bperp.1.in`, `heading.1.in`, `lambda.1.in`, `parms.json`, and
-  `localparms.json` without creating or reading a MATLAB/StaMPS
+  The Python preprocessor can generate reference-date metadata
+  (`reference_day.1.in` plus the legacy-compatible `master_day.1.in`),
+  `day.1.in`, `bperp.1.in`, `heading.1.in`, `lambda.1.in`, `parms.json`,
+  and `localparms.json` without creating or reading a MATLAB/StaMPS
   `INSAR_YYYYMMDD` directory.
 - StaMPS PS workflow Steps 1-8 are implemented in Python:
   - Step 1: initial data loading
@@ -68,9 +71,10 @@ validation runs are intentionally ignored by Git.
   - large HDF5 `bperp_mat` reads avoid slow fancy indexing
 - Step 4/5 save and merge bottlenecks have been optimized.
 - Incidence-angle extraction from ISCE2 `incLocal.rdr.full` is supported.
-- ISCE2 small-baseline preprocessing can consume existing ISCE2 interferograms
-  with `--small-baseline`, generating `ifgday.1.in`, `small_baselines.list`,
-  paired-SLC candidate selection inputs, and SB-compatible `ps1.h5` products.
+- ISCE2 shared-stack preprocessing can create PS and SB views. SB pair graphs
+  can be defined first with `define_sb_pairs.py`, then consumed by
+  `prep_isce.py` for patch/candidate preparation and by `build_sb_phase.py` for
+  SLC-native phase extraction.
 - Result export is implemented:
   - velocity in mm/yr
   - displacement time series in mm
@@ -96,6 +100,13 @@ The exported GeoPackage test completed with:
 - 1,651,830 point features
 - `vel` plus 45 date fields
 - default correction `v-dso`: SCLA + SCN correction followed by deramp
+
+The SLC-native Small Baseline workflow has also been run on a real ISCE2
+`merged` stack through Steps 1-8. In this workflow, SB interferometric phase is
+built from co-registered SLC pairs, then inverted to single-master unwrapped
+date phases for SCLA, SCN, and export. Exported SB time series use local
+interpolation at the reference/master acquisition so that the master date does
+not appear as an artificial displacement spike.
 
 Validation datasets and generated outputs are not committed to Git because of
 size and because each user will have their own ISCE/StaMPS project layout.
@@ -160,7 +171,7 @@ python stamps_python/prep_isce.py path/to/merged \
   --run-select \
   --run-extract \
   --phase-from-slcs \
-  --write-ps1
+  --write-step1
 ```
 
 This command discovers co-registered SLCs from `SLC/YYYYMMDD/*.slc.full`,
@@ -170,9 +181,10 @@ from `geom_reference/los.rdr.full`, reads wavelength from `input_file_*`, and
 extracts longitude/latitude/DEM/incidence angle from `geom_reference/`.
 `--bootstrap-metadata` writes Python-native `parms.json` and `localparms.json`
 alongside the StaMPS-style text metadata files. `--reference-date` should be
-passed explicitly for reproducible PS processing; `--master-date` remains as a
-backward-compatible alias. `--da-thresh` controls the amplitude-dispersion
-threshold used during PS candidate selection; the default is `0.4`.
+passed explicitly for reproducible PS processing. The older `--master-date`
+spelling is retained only as a backward-compatible alias. `--da-thresh`
+controls the amplitude-dispersion threshold used during PS candidate selection;
+the default is `0.4`.
 
 To only test metadata generation without running candidate selection or phase
 extraction:
@@ -202,28 +214,132 @@ python stamps_python/prep_isce.py data/isce2_stack/merged \
   --run-select \
   --run-extract \
   --phase-from-slcs \
-  --write-ps1
+  --write-step1
 ```
 
-Prepare existing ISCE2 small-baseline interferograms:
+### Small Baseline Workflow
+
+The recommended SB workflow uses the same ISCE2 `merged` stack as the PS
+workflow and does not require an original StaMPS `INSAR_YYYYMMDD` directory.
+It is split into three preprocessing commands:
+
+1. define the SB pair graph;
+2. prepare patches, candidates, and geometry;
+3. build wrapped SB phase from the co-registered SLC pairs and write Step-1 HDF5.
+
+If the PS workflow has already been run in a directory such as
+`path/to/merged/stampsFix`, create SB under a sibling/subdirectory such as
+`path/to/merged/stampsFix/sb`. The PS products do not need to be regenerated.
+
+First define the pair graph:
+
+```bash
+python stamps_python/define_sb_pairs.py \
+  --slc-root path/to/merged \
+  --output path/to/merged/stampsFix/sb \
+  -c 3 \
+  --write-pscphase
+```
+
+Here `-c 3` means each acquisition connects to the next three acquisitions in
+time. Increase it for a denser SB graph; decrease it for fewer interferograms.
+Keep this setting in the pair-definition command because both candidate
+selection and phase extraction use the same pair list.
+
+Then prepare SB patches and candidates. This is the step that controls patch
+layout:
 
 ```bash
 python stamps_python/prep_isce.py path/to/merged \
-  --output path/to/prepared_sb \
-  --small-baseline \
+  --output path/to/merged/stampsFix/sb \
+  --prepare sb \
+  --reference-date YYYYMMDD \
+  --bootstrap-metadata \
+  --sb-pair-source list \
+  --sb-pair-list path/to/merged/stampsFix/sb/ifgday.1.in \
+  --range-patches 8 \
+  --azimuth-patches 2 \
+  --da-thresh 0.4 \
   --run-calamp \
   --run-select \
   --run-extract \
-  --write-ps1
+  --skip-phase
 ```
 
-Run StaMPS Steps 1-8:
+`--skip-phase` is intentional here: `prep_isce.py` prepares the patch layout,
+candidate files, and geometry rasters, while `build_sb_phase.py` fills the SB
+phase columns afterwards. `--da-thresh` controls SB candidate selection from
+pairwise SLC amplitude statistics. A larger value keeps more candidates.
+
+Then build `PATCH_*/pscands.1.ph` from the same SLC stack and write SB Step-1
+HDF5 products:
+
+```bash
+python stamps_python/build_sb_phase.py \
+  --prepared path/to/merged/stampsFix/sb \
+  --slc-root path/to/merged \
+  --write-step1
+```
+
+Run StaMPS Steps 1-8 on the SB project:
 
 ```bash
 python stamps_python/stamps_main.py \
   --start 1 \
   --end 8 \
-  --config path/to/prepared_project
+  --config path/to/merged/stampsFix/sb
+```
+
+By default, SB patch merging follows the original StaMPS-style
+`merge_resample_size=100`, which averages dense candidates into one
+representative point per 100 m grid cell. To keep a denser SB result, rerun from
+Step 5 with a smaller merge grid:
+
+```bash
+python stamps_python/stamps_main.py \
+  --start 5 \
+  --end 8 \
+  --config path/to/merged/stampsFix/sb \
+  --merge-resample-size 50
+```
+
+Use `--merge-resample-size 25` for a denser output, or `0` to disable merge
+resampling. Disabling resampling can preserve millions of points, but Steps 6-8
+and export will be much heavier.
+
+For a Windows path, the same sequence looks like:
+
+```powershell
+python stamps_python\define_sb_pairs.py `
+  --slc-root C:\data\isce_stack\merged `
+  --output C:\data\isce_stack\merged\stampsFix\sb `
+  -c 3 `
+  --write-pscphase
+
+python stamps_python\prep_isce.py C:\data\isce_stack\merged `
+  --output C:\data\isce_stack\merged\stampsFix\sb `
+  --prepare sb `
+  --reference-date YYYYMMDD `
+  --bootstrap-metadata `
+  --sb-pair-source list `
+  --sb-pair-list C:\data\isce_stack\merged\stampsFix\sb\ifgday.1.in `
+  --range-patches 8 `
+  --azimuth-patches 2 `
+  --da-thresh 0.4 `
+  --run-calamp `
+  --run-select `
+  --run-extract `
+  --skip-phase
+
+python stamps_python\build_sb_phase.py `
+  --prepared C:\data\isce_stack\merged\stampsFix\sb `
+  --slc-root C:\data\isce_stack\merged `
+  --write-step1
+
+python stamps_python\stamps_main.py `
+  --start 1 `
+  --end 8 `
+  --config C:\data\isce_stack\merged\stampsFix\sb
 ```
 
 ## Parameter Files
@@ -312,6 +428,12 @@ python stamps_python/export_results.py \
   --correction v-dso
 ```
 
+For SB projects, use the SB project directory as `--input-path`. The exporter
+uses `phuw2.h5` generated by SB inversion when it is available; if only
+`phuw_sb2.h5` is present, it falls back to inverting SB IFG phases for export.
+GeoPackage fields include `vel` and one displacement column per acquisition
+date.
+
 Optional Shapefile export:
 
 ```bash
@@ -324,9 +446,13 @@ python stamps_python/export_results.py \
 
 ## Important Notes
 
-- The Python workflow targets PS-InSAR and can prepare ISCE2 small-baseline
-  interferograms for the translated SB path. Full-chain SB validation should be
+- The Python workflow targets PS-InSAR and SLC-native Small Baseline processing
+  from ISCE/ISCE2 `merged` stacks. Full-chain validation should still be
   repeated for each new stack geometry before production use.
+- `prep_isce.py` can discover dates and metadata from ISCE2 `.vrt` SLC mosaics,
+  but the current `calamp` and candidate extractors read flat complex binary
+  rasters. Translate VRT-only SLC mosaics to binary rasters before running
+  `--run-calamp` or `--run-select`.
 - The project is designed around HDF5 outputs (`*.h5`) and JSON parameter files
   (`parms.json`, `localparms.json`) rather than MATLAB `.mat` files for the main
   Python path.
@@ -345,7 +471,8 @@ python stamps_python/export_results.py \
 
 ## Known Gaps / Not Yet Complete
 
-- Small Baseline workflow is not fully validated.
+- Small Baseline processing has been validated on one real ISCE2 stack, but
+  still needs broader cross-stack and cross-processor validation.
 - MATLAB plotting functions are not ported as GUI/figure tools. Only the
   non-plotting velocity/time-series export path has been extracted.
 - TRAIN/tropospheric correction integrations are not ported end to end.

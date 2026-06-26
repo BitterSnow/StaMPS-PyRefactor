@@ -66,7 +66,7 @@ class SmallBaselineIFG:
 
     date1: int
     date2: int
-    path: Path
+    path: Optional[Path] = None
 
 
 def build_patch_bounds(
@@ -266,9 +266,17 @@ def _discover_isce_stack_slcs(isce_dir: Path) -> List[Path]:
         if preferred.is_file():
             slcs.append(preferred)
             continue
+        preferred_vrt = date_dir / f"{date_dir.name}.slc.full.vrt"
+        if preferred_vrt.is_file():
+            slcs.append(preferred_vrt)
+            continue
         fallback = date_dir / f"{date_dir.name}.slc"
         if fallback.is_file():
             slcs.append(fallback)
+            continue
+        fallback_vrt = date_dir / f"{date_dir.name}.slc.vrt"
+        if fallback_vrt.is_file():
+            slcs.append(fallback_vrt)
     return slcs
 
 
@@ -356,6 +364,36 @@ def discover_small_baseline_ifgs(
         SmallBaselineIFG(date1=pair[0], date2=pair[1], path=path)
         for pair, path in sorted(found.items())
     ]
+
+
+def resolve_small_baseline_pairs(
+    args: argparse.Namespace,
+    isce_dir: Path,
+    slcs: Sequence[Path],
+) -> List[SmallBaselineIFG]:
+    """Resolve the SB pair graph from IFGs, a pair list, or SLC dates."""
+    source = args.sb_pair_source
+    if source == "list":
+        if not args.sb_pair_list:
+            raise ValueError("--sb-pair-list is required when --sb-pair-source=list")
+        return read_small_baseline_pair_list(Path(args.sb_pair_list).resolve())
+    if source == "consecutive":
+        return generate_consecutive_sb_pairs(slcs, neighbor_count=args.sb_neighbor_count)
+
+    try:
+        return discover_small_baseline_ifgs(
+            isce_dir,
+            ifg_dir=args.ifg_dir,
+            ifg_pattern=args.ifg_pattern,
+        )
+    except FileNotFoundError:
+        if source == "ifg":
+            raise
+        print(
+            "[prep_isce] no existing SB IFGs found; generating pair graph from SLC dates",
+            flush=True,
+        )
+        return generate_consecutive_sb_pairs(slcs, neighbor_count=args.sb_neighbor_count)
 
 
 def _slc_by_date(slcs: Sequence[Path]) -> dict[int, Path]:
@@ -647,8 +685,12 @@ def infer_width_length(isce_dir: Path) -> Tuple[Optional[int], Optional[int]]:
     candidates = [
         *sorted((isce_dir / "SLC").glob("[0-9]*/[0-9]*.slc.full.xml")),
         *sorted((isce_dir / "SLC").glob("[0-9]*/[0-9]*.slc.xml")),
+        *sorted((isce_dir / "merged" / "SLC").glob("[0-9]*/[0-9]*.slc.full.xml")),
+        *sorted((isce_dir / "merged" / "SLC").glob("[0-9]*/[0-9]*.slc.xml")),
         isce_dir / "geom_reference" / "lat.rdr.full.xml",
         isce_dir / "geom_reference" / "lat.rdr.xml",
+        isce_dir / "merged" / "geom_reference" / "lat.rdr.full.xml",
+        isce_dir / "merged" / "geom_reference" / "lat.rdr.xml",
     ]
     for xml_path in candidates:
         width = _isce_xml_property_int(xml_path, "width")
@@ -727,6 +769,11 @@ def discover_secondary_slcs(isce_dir: Path) -> List[Path]:
     will be expanded after the first candidate-extraction port is validated.
     """
     slcs: List[Path] = []
+    # Prefer real merged stack SLCs over legacy INSAR symlinks/placeholders.
+    slcs.extend(_discover_isce_stack_slcs(isce_dir))
+    slcs.extend(_discover_isce_stack_slcs(isce_dir.parent))
+    slcs.extend(_discover_isce_stack_slcs(isce_dir / "merged"))
+
     # Older mt_prep_isce variants used master/master.slc and */slave.slc.
     master = isce_dir / "master" / "master.slc"
     if master.is_file():
@@ -736,8 +783,25 @@ def discover_secondary_slcs(isce_dir: Path) -> List[Path]:
         slcs.append(ref)
     slcs.extend(sorted(isce_dir.glob("[0-9]*/slave.slc")))
     slcs.extend(sorted(isce_dir.glob("*/secondary.slc")))
-    slcs.extend(_discover_isce_stack_slcs(isce_dir))
-    return slcs
+
+    out: List[Path] = []
+    by_date: dict[int, Path] = {}
+    seen_paths = set()
+    for path in slcs:
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        date = _slc_date(path)
+        if date is None:
+            out.append(path)
+            continue
+        current = by_date.get(date)
+        if current is None or path.stat().st_size > current.stat().st_size:
+            by_date[date] = path
+    dated = [path for _date, path in sorted(by_date.items())]
+    undated = [path for path in out if _slc_date(path) is None]
+    return dated + undated
 
 
 def write_calamp_input(output_dir: Path, slcs: Iterable[Path]) -> Path:
@@ -784,8 +848,9 @@ def write_small_baseline_inputs(
         "".join(f"{ifg.date1} {ifg.date2}\n" for ifg in ifgs),
         encoding="ascii",
     )
+    ifg_phase_paths = [ifg.path for ifg in ifgs if ifg.path is not None]
     (output_dir / "pscphase.in").write_text(
-        f"{width}\n" + "".join(f"{ifg.path.resolve()}\n" for ifg in ifgs),
+        f"{width}\n" + "".join(f"{path.resolve()}\n" for path in ifg_phase_paths),
         encoding="utf-8",
     )
 
@@ -831,6 +896,26 @@ def write_selection_input(
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _can_build_phase_from_slc_pairs(
+    slcs: Sequence[Path],
+    pairs: Sequence[Tuple[int, int]],
+    width: int,
+) -> bool:
+    """Return true when all pair SLCs look like readable flat binaries."""
+    try:
+        slc_map = _slc_by_date(slcs)
+    except ValueError:
+        return False
+    required = {date for pair in pairs for date in pair}
+    for date in required:
+        path = slc_map.get(date)
+        if path is None or path.suffix.lower() == ".vrt":
+            return False
+        if not path.is_file() or path.stat().st_size < width * 8:
+            return False
+    return True
+
+
 def copy_root_metadata(input_dir: Path, output_dir: Path) -> None:
     """Copy root metadata files used by ISCEPSLoader when present."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -848,6 +933,16 @@ def _complex_dtype(precision: str, byteswap: bool) -> Tuple[np.dtype, int]:
     if precision.startswith("f"):
         return (np.dtype(">f4" if byteswap else "<f4"), 2)
     raise ValueError("precision must be 'f' for complex float32 or 's' for complex int16")
+
+
+def _require_binary_complex_raster(path: Path, purpose: str) -> None:
+    """Reject GDAL VRT rasters for current flat-binary readers."""
+    if path.suffix.lower() == ".vrt":
+        raise ValueError(
+            f"{purpose} requires a flat complex binary raster, but got VRT: {path}. "
+            "Translate the VRT mosaic to a binary ISCE raster first, or pass paths "
+            "to existing binary .slc/.slc.full files."
+        )
 
 
 def _read_mask_chunk(mask_fh, width: int, n_rows: int) -> np.ndarray:
@@ -875,6 +970,7 @@ def compute_calibration_constant(
     The calibration constant is the mean amplitude over pixels with
     `abs(pixel) > 0.001` and mask value equal to zero.
     """
+    _require_binary_complex_raster(slc_path, "calamp")
     scalar_dtype, scalars_per_complex = _complex_dtype(precision, byteswap)
     scalar_size = scalar_dtype.itemsize
     row_bytes = width * scalars_per_complex * scalar_size
@@ -1001,6 +1097,7 @@ def _read_complex_window(
     scalar_dtype: np.dtype,
 ) -> np.ndarray:
     """Read one row/range complex window from an SLC."""
+    _require_binary_complex_raster(Path(getattr(fh, "name", "")), "complex sample extraction")
     scalar_size = scalar_dtype.itemsize
     offset = (row_0 * width + start_rg_0) * 2 * scalar_size
     fh.seek(offset)
@@ -1562,6 +1659,76 @@ def extract_phase_from_slcs(
     return ph
 
 
+def extract_phase_from_slc_pairs(
+    slcs: Sequence[Path],
+    pairs: Sequence[Tuple[int, int]],
+    ij_path: Path,
+    width: int,
+    output_path: Path,
+    precision: str = "f",
+    byteswap: bool = False,
+) -> np.ndarray:
+    """Write wrapped phase samples for arbitrary SLC date pairs.
+
+    Each output column is ``slc[date1] * conj(slc[date2])`` sampled at the
+    candidate coordinates.  This matches the ISCE/StaMPS convention used by
+    the PS path (reference * conj(secondary)); downstream SB inversion maps the
+    pair phase to ``x(date2) - x(date1)`` where ``x`` is master-referenced
+    phase.
+    """
+    slc_map = _slc_by_date(slcs)
+    missing = sorted({date for pair in pairs for date in pair if date not in slc_map})
+    if missing:
+        raise FileNotFoundError(
+            "Missing co-registered SLCs for phase pair date(s): "
+            + ", ".join(str(date) for date in missing)
+        )
+
+    ij = read_candidate_ij(ij_path)
+    yx = ij[:, [1, 2]]
+    scalar_dtype, _ = _complex_dtype(precision, byteswap)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ph = np.empty((len(pairs), yx.shape[0]), dtype=np.complex64)
+    if yx.size == 0:
+        ph.tofile(output_path)
+        return ph
+
+    row_groups: List[Tuple[int, np.ndarray, np.ndarray]] = []
+    for y0 in np.unique(yx[:, 0]):
+        cand_ix = np.flatnonzero(yx[:, 0] == y0)
+        x_values = yx[cand_ix, 1].astype(np.int64, copy=False)
+        row_groups.append((int(y0), cand_ix, x_values))
+
+    date_handles: dict[int, object] = {}
+    try:
+        for date in sorted({date for pair in pairs for date in pair}):
+            date_handles[date] = slc_map[date].open("rb")
+
+        for y0, cand_ix, x_values in row_groups:
+            x_min = int(x_values.min())
+            x_max = int(x_values.max())
+            count = x_max - x_min + 1
+            x_rel = x_values - x_min
+            row_cache: dict[int, np.ndarray] = {}
+            for date in date_handles:
+                row_cache[date] = _read_complex_window(
+                    date_handles[date],
+                    width=width,
+                    row_0=y0,
+                    start_rg_0=x_min,
+                    count=count,
+                    scalar_dtype=scalar_dtype,
+                )[x_rel]
+            for i, (date1, date2) in enumerate(pairs):
+                ph[i, cand_ix] = row_cache[date1] * np.conj(row_cache[date2])
+    finally:
+        for fh in date_handles.values():
+            fh.close()
+
+    ph.tofile(output_path)
+    return ph
+
+
 def read_path_list(path: Path, skip_first_width: bool = False) -> List[Path]:
     """Read helper files such as pscphase.in/psclonlat.in/pscdem.in."""
     lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
@@ -1608,11 +1775,94 @@ def write_ps1_h5_outputs(
         _save_no_ps_info(no_ps_path, stamps_step_no_ps)
 
 
-def run_preparation(args: argparse.Namespace) -> None:
+def _parse_prepare_modes(value: Optional[str], legacy_small_baseline: bool) -> List[str]:
+    """Resolve requested StaMPS view(s) from --prepare/--small-baseline."""
+    if value is None:
+        return ["sb" if legacy_small_baseline else "ps"]
+    text = value.strip().lower()
+    if text == "auto":
+        return ["auto"]
+    parts = [part.strip().lower() for part in re.split(r"[,+]", text) if part.strip()]
+    invalid = [part for part in parts if part not in {"ps", "sb"}]
+    if invalid or not parts:
+        raise ValueError("--prepare must be one of: ps, sb, ps,sb, auto")
+    out: List[str] = []
+    for part in parts:
+        if part not in out:
+            out.append(part)
+    return out
+
+
+def _slc_dates(slcs: Sequence[Path]) -> List[int]:
+    """Return sorted unique SLC dates."""
+    return sorted({date for path in slcs if (date := _slc_date(path)) is not None})
+
+
+def generate_consecutive_sb_pairs(
+    slcs: Sequence[Path],
+    neighbor_count: int = 3,
+) -> List[SmallBaselineIFG]:
+    """Generate a simple small-baseline graph from neighboring SLC dates."""
+    if neighbor_count <= 0:
+        raise ValueError("--sb-neighbor-count must be positive")
+    dates = _slc_dates(slcs)
+    out: List[SmallBaselineIFG] = []
+    for i, date1 in enumerate(dates):
+        for date2 in dates[i + 1 : i + 1 + neighbor_count]:
+            out.append(SmallBaselineIFG(date1=date1, date2=date2, path=None))
+    if not out:
+        raise ValueError("Not enough SLC dates to generate small-baseline pairs")
+    return out
+
+
+def read_small_baseline_pair_list(path: Path) -> List[SmallBaselineIFG]:
+    """Read a two-column YYYYMMDD pair list."""
+    pairs: List[SmallBaselineIFG] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        parts = re.split(r"[\s,]+", text)
+        if len(parts) < 2:
+            raise ValueError(f"Invalid SB pair line in {path}: {line!r}")
+        pairs.append(SmallBaselineIFG(date1=int(parts[0]), date2=int(parts[1]), path=None))
+    if not pairs:
+        raise ValueError(f"No small-baseline pairs found in {path}")
+    return pairs
+
+
+def _auto_prepare_modes(args: argparse.Namespace, isce_dir: Path) -> List[str]:
+    """Auto-detect whether the stack can support PS and SB views."""
+    slcs = discover_secondary_slcs(isce_dir)
+    if len(_slc_dates(slcs)) >= 2:
+        print(
+            "[prep_isce] auto: found co-registered SLC stack; preparing PS and SB views",
+            flush=True,
+        )
+        return ["ps", "sb"]
+    try:
+        ifgs = discover_small_baseline_ifgs(
+            isce_dir,
+            ifg_dir=args.ifg_dir,
+            ifg_pattern=args.ifg_pattern,
+        )
+    except FileNotFoundError:
+        print("[prep_isce] auto: no SB-capable SLC/IFG stack found; preparing PS only", flush=True)
+        return ["ps"]
+    print(
+        f"[prep_isce] auto: found {len(ifgs)} small-baseline IFGs; preparing PS and SB views",
+        flush=True,
+    )
+    return ["ps", "sb"]
+
+
+def _run_preparation_for_mode(
+    args: argparse.Namespace,
+    isce_dir: Path,
+    output_dir: Path,
+    small_baseline: bool,
+) -> None:
     """Prepare layout and inputs; candidate extraction is implemented next."""
-    isce_dir = Path(args.isce_dir).resolve()
-    output_dir = Path(args.output).resolve()
-    small_baseline = bool(args.small_baseline)
     reference_date = args.reference_date if args.reference_date is not None else args.master_date
 
     width = args.width
@@ -1637,11 +1887,7 @@ def run_preparation(args: argparse.Namespace) -> None:
     slcs = discover_secondary_slcs(isce_dir)
     sb_ifgs: List[SmallBaselineIFG] = []
     if small_baseline:
-        sb_ifgs = discover_small_baseline_ifgs(
-            isce_dir,
-            ifg_dir=args.ifg_dir,
-            ifg_pattern=args.ifg_pattern,
-        )
+        sb_ifgs = resolve_small_baseline_pairs(args, isce_dir, slcs)
     write_inferred_root_metadata(
         isce_dir,
         output_dir,
@@ -1654,8 +1900,6 @@ def run_preparation(args: argparse.Namespace) -> None:
         write_parms_json=args.bootstrap_metadata,
         small_baseline=small_baseline,
     )
-    if args.metadata_only:
-        return
 
     if small_baseline:
         write_small_baseline_inputs(
@@ -1666,6 +1910,9 @@ def run_preparation(args: argparse.Namespace) -> None:
             master_date=reference_date,
             input_dir=isce_dir,
         )
+    if args.metadata_only:
+        return
+
     calamp_in = (
         Path(args.calamp_input).resolve()
         if args.calamp_input
@@ -1731,12 +1978,39 @@ def run_preparation(args: argparse.Namespace) -> None:
                     mask_path=mask_path,
                     da_thresh=args.da_thresh,
                 )
+    if args.skip_phase and args.write_ps1:
+        raise ValueError(
+            "--write-ps1 requires phase samples. Run build_sb_phase.py --write-step1 "
+            "after --skip-phase SB preparation."
+        )
+
     if args.run_extract or args.extract_only:
         ifg_paths: List[Path] = []
-        if args.ifg_list:
-            ifg_paths = read_path_list(Path(args.ifg_list).resolve(), skip_first_width=args.ifg_list_has_width)
-        elif small_baseline:
-            ifg_paths = [ifg.path for ifg in sb_ifgs]
+        slc_phase_pairs: List[Tuple[int, int]] = []
+        if args.skip_phase:
+            print("[prep_isce] skipping phase extraction (--skip-phase)", flush=True)
+        else:
+            if args.ifg_list:
+                ifg_paths = read_path_list(Path(args.ifg_list).resolve(), skip_first_width=args.ifg_list_has_width)
+            elif small_baseline:
+                sb_pairs = [(ifg.date1, ifg.date2) for ifg in sb_ifgs]
+                phase_source = args.phase_source
+                if phase_source == "auto":
+                    phase_source = (
+                        "slc"
+                        if _can_build_phase_from_slc_pairs(slcs, sb_pairs, width)
+                        else "ifg"
+                    )
+                    print(f"[prep_isce] SB phase-source auto -> {phase_source}", flush=True)
+                if phase_source == "slc":
+                    slc_phase_pairs = sb_pairs
+                else:
+                    ifg_paths = [ifg.path for ifg in sb_ifgs if ifg.path is not None]
+                    if len(ifg_paths) != len(sb_ifgs):
+                        raise ValueError(
+                            "SB phase-source=ifg requires an IFG path for every pair. "
+                            "Use --phase-source slc or provide --ifg-dir/--sb-pair-source ifg."
+                        )
         lon_path = Path(args.lon).resolve() if args.lon else isce_dir / "geom_reference" / "lon.rdr.full"
         lat_path = Path(args.lat).resolve() if args.lat else isce_dir / "geom_reference" / "lat.rdr.full"
         dem_path = Path(args.dem).resolve() if args.dem else isce_dir / "geom_reference" / "hgt.rdr.full"
@@ -1771,7 +2045,19 @@ def run_preparation(args: argparse.Namespace) -> None:
                     patch_dir / "pscands.1.la",
                     band=args.look_angle_band,
                 )
-            if ifg_paths:
+            if args.skip_phase:
+                continue
+            if slc_phase_pairs:
+                extract_phase_from_slc_pairs(
+                    slcs,
+                    slc_phase_pairs,
+                    ij_path,
+                    width,
+                    patch_dir / "pscands.1.ph",
+                    precision=args.precision,
+                    byteswap=args.byteswap,
+                )
+            elif ifg_paths:
                 extract_phase(
                     ifg_paths,
                     ij_path,
@@ -1808,18 +2094,64 @@ def run_preparation(args: argparse.Namespace) -> None:
     )
 
 
+def run_preparation(args: argparse.Namespace) -> None:
+    """Prepare one or more StaMPS views from a shared ISCE2 stack."""
+    isce_dir = Path(args.isce_dir).resolve()
+    output_root = Path(args.output).resolve()
+    modes = _parse_prepare_modes(args.prepare, bool(args.small_baseline))
+    if modes == ["auto"]:
+        modes = _auto_prepare_modes(args, isce_dir)
+
+    multi_view = args.prepare is not None and (len(modes) > 1 or args.prepare.strip().lower() == "auto")
+    for mode in modes:
+        out_dir = output_root / mode if multi_view else output_root
+        print(
+            f"[prep_isce] preparing {mode.upper()} view -> {out_dir}",
+            flush=True,
+        )
+        _run_preparation_for_mode(
+            args,
+            isce_dir=isce_dir,
+            output_dir=out_dir,
+            small_baseline=(mode == "sb"),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare ISCE products for the Python StaMPS pipeline."
     )
     parser.add_argument("isce_dir", help="ISCE project directory")
     parser.add_argument("--output", required=True, help="Prepared output directory")
-    parser.add_argument("--small-baseline", action="store_true", help="Prepare ISCE2 small-baseline interferograms")
+    parser.add_argument(
+        "--prepare",
+        default=None,
+        help="StaMPS view(s) to prepare from the shared stack: ps, sb, ps,sb, or auto",
+    )
+    parser.add_argument(
+        "--small-baseline",
+        action="store_true",
+        help="Legacy alias for --prepare sb when --prepare is not set",
+    )
     parser.add_argument("--ifg-dir", default=None, help="Directory containing ISCE2 small-baseline interferograms")
     parser.add_argument(
         "--ifg-pattern",
         default="filt_*.int,fine.int,isce_minrefdem.int",
         help="Comma-separated IFG glob pattern priority list",
+    )
+    parser.add_argument(
+        "--sb-pair-source",
+        choices=["auto", "ifg", "consecutive", "list"],
+        default="auto",
+        help="Small-baseline pair graph source",
+    )
+    parser.add_argument("--sb-pair-list", default=None, help="Text file with SB date pairs for --sb-pair-source=list")
+    parser.add_argument(
+        "-c",
+        "--sb-neighbor-count",
+        type=int,
+        default=3,
+        help="Number of forward neighboring acquisitions for generated SB pairs",
     )
     parser.add_argument("--da-thresh", type=float, default=0.4)
     parser.add_argument("--range-patches", type=int, default=1)
@@ -1834,7 +2166,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--select-only", action="store_true", help="Only run PS candidate selection and exit")
     parser.add_argument("--run-extract", action="store_true", help="Extract lon/lat, DEM, and phase samples")
     parser.add_argument("--extract-only", action="store_true", help="Only run extraction and exit")
-    parser.add_argument("--write-ps1", action="store_true", help="Write PATCH_*/ps1.h5 via ISCEPSLoader")
+    parser.add_argument(
+        "--skip-phase",
+        action="store_true",
+        help="During extraction, write geometry rasters only and leave pscands.1.ph for a separate phase builder",
+    )
+    parser.add_argument(
+        "--write-ps1",
+        "--write-step1",
+        dest="write_ps1",
+        action="store_true",
+        help="Write PATCH_*/ps1.h5 Step-1 HDF5 products",
+    )
     parser.add_argument(
         "--bootstrap-metadata",
         action="store_true",
@@ -1855,6 +2198,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-look-angle", action="store_true", help="Also extract look-angle samples to pscands.1.la/la1.h5")
     parser.add_argument("--ifg-list", default=None, help="Text file listing complex interferograms")
     parser.add_argument("--ifg-list-has-width", action="store_true", help="First line of --ifg-list is width")
+    parser.add_argument(
+        "--phase-source",
+        choices=["auto", "slc", "ifg"],
+        default="auto",
+        help="Phase source for SB mode: build pairs from SLCs, read existing IFGs, or auto-select",
+    )
     parser.add_argument("--phase-from-slcs", action="store_true", help="Build PS phase samples from co-registered SLCs")
     parser.add_argument("--master-date", type=int, default=None, help="Master/reference date as YYYYMMDD")
     parser.add_argument(

@@ -215,14 +215,21 @@ class ScnFiltPipeline:
 
         # Load data (HDF5 only)
         ps = self._load_ps(v)
-        uw = self._load_phuw(v, small_baseline_flag == "y")
+        use_sb_ifgs = small_baseline_flag == "y" and not (self.patch_dir / f"phuw{v}.h5").is_file()
+        uw = self._load_phuw(v, use_sb_ifgs)
         n_ps = ps["n_ps"]
         n_ifg_full = int(np.asarray(ps["n_ifg"]).ravel()[0])
         day_full = np.asarray(ps["day"]).ravel()
         master_day = float(np.asarray(ps["master_day"]).ravel()[0])
 
         # Unwrap IFG index (0-based). MATLAB: SB -> [1:ps.n_image]; else setdiff([1:n_ifg], drop)
-        if small_baseline_flag == "y":
+        if small_baseline_flag == "y" and not use_sb_ifgs:
+            n_image = ps.get("n_image")
+            if n_image is None:
+                n_image = uw["ph_uw"].shape[1]
+            unwrap_ifg_index = np.arange(n_image, dtype=np.int32)
+            n_ifg_full = n_image
+        elif small_baseline_flag == "y":
             n_image = ps.get("n_image")
             if n_image is None:
                 n_image = uw["ph_uw"].shape[1]
@@ -246,6 +253,8 @@ class ScnFiltPipeline:
         # ph_all: (n_ps, n_ifg), MATLAB: ph_all = uw.ph_uw(:, unwrap_ifg_index)
         ph_all = np.asarray(uw["ph_uw"][:, unwrap_ifg_index], dtype=np.float64)
         scla_path = self.patch_dir / f"scla{v}.h5"
+        if use_sb_ifgs:
+            scla_path = self.patch_dir / f"scla_sb{v}.h5"
         if scla_path.is_file():
             scla = _load_h5(scla_path, ["ph_scla", "C_ps_uw", "ph_ramp"])
             ph_scla = np.asarray(scla["ph_scla"])
@@ -254,14 +263,21 @@ class ScnFiltPipeline:
                 ph_all = ph_all - ph_scla
             elif ph_scla.ndim == 2 and ph_scla.shape[1] > int(unwrap_ifg_index.max()):
                 ph_all = ph_all - ph_scla[:, unwrap_ifg_index]
-            if C_ps_uw.size == n_ps:
+            subtract_c_for_scn = not (small_baseline_flag == "y" and not use_sb_ifgs)
+            if C_ps_uw.size == n_ps and subtract_c_for_scn:
                 ph_all = ph_all - np.broadcast_to(C_ps_uw[:, np.newaxis], ph_all.shape)
+            elif C_ps_uw.size == n_ps:
+                logger.info(
+                    "   SB single-master SCN: leaving C_ps_uw out of the temporal filter"
+                )
             if "ph_ramp" in scla and scla["ph_ramp"] is not None:
                 ph_ramp_scla = np.asarray(scla["ph_ramp"])
                 if ph_ramp_scla.shape == ph_all.shape:
                     ph_all = ph_all - ph_ramp_scla
                 elif ph_ramp_scla.ndim == 2 and ph_ramp_scla.shape[1] > int(unwrap_ifg_index.max()):
                     ph_all = ph_all - ph_ramp_scla[:, unwrap_ifg_index]
+        else:
+            logger.warning("   SCLA file not found for SCN correction: %s", scla_path.name)
         ph_all = np.nan_to_num(ph_all, nan=0.0)
 
         logger.info("   Number of points per ifg: %d", n_ps)

@@ -88,7 +88,7 @@ project_root/
 | `pscands.1.hgt` | 高程数据 | 二进制，float32 |
 | `bperp.1.in` | 垂直基线 | 文本，每景一个值 |
 | `day.1.in` | 获取日期 | 文本，YYYYMMDD 格式 |
-| `master_day.1.in` | 主影像日期 | 文本，YYYYMMDD 格式 |
+| `master_day.1.in` | 参考影像日期（legacy-compatible 字段名） | 文本，YYYYMMDD 格式 |
 | `heading.1.in` | 卫星航向角 | 文本，单值 |
 | `lambda.1.in` | 雷达波长 | 文本，单值 |
 | `width.txt` | 影像宽度 | 文本 |
@@ -159,7 +159,7 @@ python stamps_main.py --start 1 --end 1 --config <数据目录>
 | pscands.1.da | 振幅离差 |
 | pscands.1.hgt | 高程 |
 | bperp.1.in | 垂直基线 |
-| day.1.in, master_day.1.in | 日期 |
+| day.1.in, master_day.1.in | 日期（`master_day` 为兼容字段名，含义是参考日期） |
 | heading.1.in, lambda.1.in | 参数 |
 | calamp.out | 定标系数 |
 | width.txt, len.txt | 影像尺寸 |
@@ -173,8 +173,8 @@ python stamps_main.py --start 1 --end 1 --config <数据目录>
 | | xy | (n_ps, 3) float32 | [ID, x, y] 局部坐标 |
 | | bperp | (n_ifg,) float64 | 垂直基线 |
 | | bperp_mat | (n_ps, n_ifg-1) float32 | 逐点基线矩阵 |
-| | day, master_day | int32 | 日期 (Matlab datenum) |
-| | master_ix | int32 | 主影像索引 (1-based) |
+| | day, master_day | int32 | 日期 (Matlab datenum；`master_day` 为兼容字段名，含义是参考日期) |
+| | master_ix | int32 | 参考影像索引 (1-based；legacy-compatible 字段名) |
 | | sort_ix | (n_ps,) int32 | 排序索引 |
 | | D_A | (n_ps,) float64 | 振幅离差 |
 | | hgt | (n_ps,) float32 | 高程 |
@@ -188,7 +188,7 @@ python stamps_main.py --start 1 --end 1 --config <数据目录>
 
 **注意事项**:
 - 日期格式转换: Matlab datenum = Python ordinal + 366
-- 索引格式: HDF5 中 master_ix、sort_ix 为 1-based，内部使用时转为 0-based
+- 索引格式: HDF5 中 `master_ix`（参考影像索引，legacy-compatible 字段名）、`sort_ix` 为 1-based，内部使用时转为 0-based
 - 若存在 `baselineGRID_*` 目录，将加载逐像素基线网格
 
 ---
@@ -212,7 +212,7 @@ python stamps_main.py --start 2 --end 2 --config <数据目录>
 | 文件 | 数据集 | 形状 | 说明 |
 |------|--------|------|------|
 | pm1.h5 | K_ps | (n_ps,) float64 | DEM 误差系数 |
-| | C_ps | (n_ps,) float64 | 主影像相位偏差 |
+| | C_ps | (n_ps,) float64 | 参考影像相位偏差 |
 | | coh_ps | (n_ps,) float64 | 相干性 (gamma) |
 | | ph_patch | (n_ps, n_ifg-1) complex64 | 空间滤波后相位 |
 | | ph_res | (n_ps, n_ifg-1) float32 | 残余相位 |
@@ -372,7 +372,7 @@ python stamps_main.py --start 5 --end 5 --config <数据目录>
 **校正公式**:
 ```
 ph_rc = ph * exp(-j * (K_ps * bperp_mat + C_ps))
-ph_reref = ph_patch (with master column = 1)
+ph_reref = ph_patch (with reference column = 1)
 ```
 
 **注意事项**:
@@ -401,7 +401,7 @@ python stamps_main.py --start 6 --end 6 --config <数据目录>
 | 文件 | 数据集 | 形状 | 说明 |
 |------|--------|------|------|
 | phuw2.h5 | ph_uw | (n_ps, n_ifg) float32 | 解缠后相位 (弧度) |
-| | msd | (n_ifg,) float32 | 主从差质量指标 |
+| | msd | (n_ifg,) float32 | 参考-次影像差质量指标 |
 
 **关键参数**:
 | 参数 | 默认值 | 说明 |
@@ -426,14 +426,14 @@ python stamps_main.py --start 6 --end 6 --config <数据目录>
 
 **注意事项**:
 - 需要 snaphu v2.0.7 在 PATH 或配置中指定
-- master 列相位保持为零
-- 若 SB 模式，需运行 sb_invert_uw 转换单主影像序列
+- reference 列相位保持为零
+- 若 SB 模式，需运行 sb_invert_uw 转换单参考影像序列
 
 ---
 
 ### Step 7: SCLA 估算
 
-**功能**: 估计空间相关视角误差 (DEM 误差) 和主影像大气/轨道误差
+**功能**: 估计空间相关视角误差 (DEM 误差) 和参考影像大气/轨道误差
 
 **运行命令**:
 ```bash
@@ -450,7 +450,7 @@ python stamps_main.py --start 7 --end 7 --config <数据目录>
 | 文件 | 数据集 | 形状 | 说明 |
 |------|--------|------|------|
 | scla2.h5 | K_ps_uw | (n_ps,) float32 | DEM 误差系数 |
-| | C_ps_uw | (n_ps,) float32 | 主影像大气误差 |
+| | C_ps_uw | (n_ps,) float32 | 参考影像大气误差 |
 | | ph_scla | (n_ps, n_ifg) float32 | SCLA 相位校正量 |
 | | ifg_vcm | (n_ifg, n_ifg) float32 | 干涉图方差-协方差矩阵 |
 | scla_smooth2.h5 | K_ps_uw | (n_ps,) | 平滑后参数 |
@@ -496,7 +496,7 @@ python stamps_main.py --start 8 --end 8 --config <数据目录>
 **输出文件**:
 | 文件 | 数据集 | 形状 | 说明 |
 |------|--------|------|------|
-| scn2.h5 | ph_scn_slave | (n_ps, n_ifg) float32 | 空间低通滤波后相位 |
+| scn2.h5 | ph_scn_slave | (n_ps, n_ifg) float32 | 空间低通滤波后相位（legacy-compatible 数据集名） |
 | | ph_hpt | (n_ps, n_ifg) float32 | 高通时域相位 |
 | | ph_ramp | (n_ps, 0) or (n_ps, n_ifg) | 轨道斜坡 |
 
@@ -514,10 +514,10 @@ python stamps_main.py --start 8 --end 8 --config <数据目录>
 3. 时域高斯低通滤波 → dph_lpt
 4. 高通时域相位: dph_hpt = dph - dph_lpt
 5. 稀疏求解恢复逐像素 ph_hpt
-6. 空间高斯低通滤波 → ph_scn_slave
+6. 空间高斯低通滤波 → ph_scn_slave（legacy-compatible 数据集名）
 
 **注意事项**:
-- master 列保持为零
+- reference 列保持为零
 - 空间滤波半径 = 4 × scn_wavelength
 
 ---

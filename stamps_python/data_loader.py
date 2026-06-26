@@ -1358,6 +1358,23 @@ class ISCESBLoader(ISCEPSLoader):
                     self.n_ps,
                 )
 
+        for key, attr_name in [("inc", "inc"), ("la_ps", "la")]:
+            angle_path = self._resolve_optional(key)
+            if angle_path is None:
+                continue
+            angle = self._read_hgt(angle_path)
+            if angle.shape[0] == n_ps_raw:
+                setattr(self, attr_name, angle[nonzero_ix][sort_ix])
+            elif angle.shape[0] == self.n_ps:
+                setattr(self, attr_name, angle[sort_ix])
+            else:
+                logger.warning(
+                    "%s has %d entries, n_ps=%d - skipping",
+                    angle_path.name,
+                    angle.shape[0],
+                    self.n_ps,
+                )
+
         # Width & Length
         try:
             width_path = self._resolve("width")

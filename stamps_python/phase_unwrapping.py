@@ -516,12 +516,78 @@ class UnwrapPipeline:
         phuw_sb_path: Path,
         unwrap_ifg_index: np.ndarray,
     ) -> None:
-        """Invert unwrapped SB ifg phase to single-master time series. Stub.
+        """Invert unwrapped SB IFG phase to single-master time series.
 
-        MATLAB: sb_invert_uw. Would read phuw_sb.h5, ps*.h5, pm*.h5/rc*.h5; write phuw.h5, phuw_sb_res.h5.
+        The SB IFG phase follows the StaMPS/ISCE convention
+        ``phase(date1,date2) = x(date2) - x(date1)``, where ``x`` is the
+        master-referenced single-image phase and the master column is fixed to
+        zero.  This is the core algebra of MATLAB ``sb_invert_uw``.
         """
-        logger.warning(
-            "Step 6 sb_invert_uw not yet implemented; skipping inversion."
+        if not phuw_sb_path.is_file():
+            raise FileNotFoundError(f"Missing SB unwrapped phase: {phuw_sb_path}")
+
+        with h5py.File(str(phuw_sb_path), "r") as hf:
+            phuw_sb = np.asarray(hf["ph_uw"][:], dtype=np.float64)
+            msd_sb = np.asarray(hf["msd"][:], dtype=np.float64).ravel() if "msd" in hf else None
+
+        if unwrap_ifg_index.size:
+            pair_ix_1 = np.asarray(ps["ifgday_ix"], dtype=np.int32)[unwrap_ifg_index]
+        else:
+            pair_ix_1 = np.asarray(ps["ifgday_ix"], dtype=np.int32)
+        if pair_ix_1.ndim != 2 or pair_ix_1.shape[1] != 2:
+            raise ValueError("SB inversion requires ifgday_ix with shape (n_ifg, 2)")
+        if pair_ix_1.shape[0] != phuw_sb.shape[1]:
+            raise ValueError(
+                f"SB inversion pair count {pair_ix_1.shape[0]} does not match "
+                f"{phuw_sb_path.name}/ph_uw columns {phuw_sb.shape[1]}"
+            )
+
+        pair_ix = pair_ix_1.astype(np.int64) - 1
+        n_image = int(np.asarray(ps["day"]).ravel().size)
+        master_ix_0 = int(ps["master_ix"]) - 1
+        keep_cols = np.array([i for i in range(n_image) if i != master_ix_0], dtype=np.int64)
+
+        G = np.zeros((pair_ix.shape[0], n_image), dtype=np.float64)
+        G[np.arange(pair_ix.shape[0]), pair_ix[:, 0]] = -1.0
+        G[np.arange(pair_ix.shape[0]), pair_ix[:, 1]] = 1.0
+        G_sub = G[:, keep_cols]
+        G_pinv = np.linalg.pinv(G_sub)
+
+        phuw_no_master = phuw_sb @ G_pinv.T
+        phuw_sm = np.zeros((phuw_sb.shape[0], n_image), dtype=np.float32)
+        phuw_sm[:, keep_cols] = phuw_no_master.astype(np.float32)
+        phuw_sm[:, master_ix_0] = 0.0
+
+        phuw_sb_fit = phuw_no_master @ G_sub.T
+        phuw_sb_res = phuw_sb - phuw_sb_fit
+
+        if msd_sb is not None and msd_sb.size == G_sub.shape[0]:
+            sb_var = np.maximum(msd_sb.astype(np.float64), 1e-6)
+        else:
+            sb_var = np.nanvar(phuw_sb_res, axis=0)
+            sb_var = np.maximum(sb_var, 1e-6)
+        sb_cov = np.diag(sb_var.astype(np.float32))
+        sm_cov = G_pinv @ np.diag(sb_var) @ G_pinv.T
+
+        phuw_path = self.patch_dir / f"phuw{v}.h5"
+        with h5py.File(str(phuw_path), "w") as hf:
+            hf.create_dataset("ph_uw", data=phuw_sm, compression="gzip")
+            hf.create_dataset("msd", data=np.zeros(n_image, dtype=np.float32))
+
+        res_path = self.patch_dir / f"phuw_sb_res{v}.h5"
+        with h5py.File(str(res_path), "w") as hf:
+            hf.create_dataset("ph_uw_res", data=phuw_sb_res.astype(np.float32), compression="gzip")
+            hf.create_dataset("sb_cov", data=sb_cov, compression="gzip")
+            hf.create_dataset("sm_cov", data=sm_cov.astype(np.float32), compression="gzip")
+            hf.create_dataset("G", data=G_sub.astype(np.float32))
+            hf.create_dataset("image_ix", data=(keep_cols + 1).astype(np.int32))
+
+        logger.info(
+            "Saved %s (ph_uw %s) and %s (residual %s)",
+            phuw_path.name,
+            phuw_sm.shape,
+            res_path.name,
+            phuw_sb_res.shape,
         )
 
 

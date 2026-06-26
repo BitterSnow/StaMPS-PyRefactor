@@ -83,9 +83,60 @@ def _parse_drop_ifg(raw: Any, n_ifg: int) -> np.ndarray:
     return (arr - 1).astype(np.int64)
 
 
-def _matlab_datenum_to_yyyymmdd(dnum: Union[int, float]) -> str:
-    # MATLAB datenum 1 is 0000-01-01; Python ordinal 1 is 0001-01-01.
-    return date.fromordinal(int(round(float(dnum))) - 366).strftime("%Y%m%d")
+def _yyyymmdd_to_ordinal(value: int) -> int:
+    y = value // 10000
+    m = (value % 10000) // 100
+    d = value % 100
+    return date(y, m, d).toordinal()
+
+
+def _read_text_yyyymmdd(path: Path) -> list[int]:
+    if not path.is_file():
+        return []
+    out: list[int] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        text = line.strip().split()
+        if not text:
+            continue
+        token = text[0]
+        if token.isdigit() and len(token) == 8:
+            out.append(int(token))
+    return out
+
+
+def _infer_date_offset(project_dir: Path, raw_dates: np.ndarray, master_day: float) -> int:
+    """Infer whether StaMPS serial dates are Python ordinals or MATLAB datenums.
+
+    MATLAB datenums are exactly Python ordinals + 366 for modern dates.  Both
+    serial systems fall in the same numeric range, so use the original text
+    metadata when available instead of relying on plausibility.
+    """
+    text_dates = _read_text_yyyymmdd(project_dir / "day.1.in")
+    text_dates.extend(_read_text_yyyymmdd(project_dir / "master_day.1.in"))
+    if not text_dates:
+        # Prefer MATLAB datenum for legacy StaMPS files; this also matches the
+        # preprocessor sidecar text files used by current project directories.
+        return 366
+
+    raw_set = {int(round(float(x))) for x in np.asarray(raw_dates).ravel()}
+    raw_set.add(int(round(float(master_day))))
+    text_ord = {_yyyymmdd_to_ordinal(x) for x in text_dates}
+
+    if raw_set & {x + 366 for x in text_ord}:
+        return 366
+    if raw_set & text_ord:
+        return 0
+
+    logger.warning(
+        "Could not match HDF5 date serials to day.1.in/master_day.1.in; "
+        "assuming MATLAB datenum offset"
+    )
+    return 366
+
+
+def _serial_to_yyyymmdd(day_value: Union[int, float], offset: int) -> str:
+    ordinal = int(round(float(day_value))) - offset
+    return date.fromordinal(ordinal).strftime("%Y%m%d")
 
 
 def _phase_to_mm(phase_rad: np.ndarray, wavelength_m: float) -> np.ndarray:
@@ -199,6 +250,30 @@ def _velocity_from_phase(
     return -slope * (365.25 / (4.0 * np.pi) * wavelength_m * 1000.0)
 
 
+def _sb_pairs_to_single_master(
+    ph_sb: np.ndarray,
+    ifgday_ix: np.ndarray,
+    n_image: int,
+    master_ix_0: int,
+) -> np.ndarray:
+    """Invert SB pair phases to single-master acquisition phases.
+
+    ``ifgday_ix`` is stored in MATLAB convention (1-based image indices).
+    The master column is constrained to zero and omitted from the returned
+    matrix.
+    """
+    ix0 = np.asarray(ifgday_ix, dtype=np.int64) - 1
+    if ix0.ndim != 2 or ix0.shape[1] != 2:
+        raise ValueError("ifgday_ix must be an n_ifg x 2 matrix")
+    G = np.zeros((ix0.shape[0], n_image), dtype=np.float64)
+    G[np.arange(ix0.shape[0]), ix0[:, 0]] = -1.0
+    G[np.arange(ix0.shape[0]), ix0[:, 1]] = 1.0
+    keep_cols = np.array([i for i in range(n_image) if i != master_ix_0], dtype=np.int64)
+    G_sub = G[:, keep_cols]
+    solver = np.linalg.pinv(G_sub)
+    return ph_sb @ solver.T
+
+
 def _select_reference_ps(lonlat: np.ndarray, xy: np.ndarray, cfg: StampsConfig) -> np.ndarray:
     try:
         from scla_estimation import _ps_setref
@@ -220,17 +295,32 @@ def _load_corrected_phase(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
     ps_path = project_dir / f"ps{psver}.h5"
     phuw_path = project_dir / f"phuw{psver}.h5"
-    if not ps_path.is_file() or not phuw_path.is_file():
-        raise FileNotFoundError(f"Need {ps_path.name} and {phuw_path.name} in {project_dir}")
+    phuw_sb_path = project_dir / f"phuw_sb{psver}.h5"
+    if not ps_path.is_file():
+        raise FileNotFoundError(f"Need {ps_path.name} in {project_dir}")
 
-    ps = _load_h5(ps_path, ["n_ps", "n_ifg", "master_ix", "master_day", "day", "xy", "lonlat"])
-    ph_uw = _load_h5(phuw_path, ["ph_uw"])["ph_uw"].astype(np.float64)
+    ps = _load_h5(
+        ps_path,
+        ["n_ps", "n_ifg", "n_image", "master_ix", "master_day", "day", "xy", "lonlat", "ifgday_ix"],
+    )
+    cfg = StampsConfig(work_dir=project_dir)
+    small_baseline = str(cfg.getparm("small_baseline_flag") or "n").strip().lower() == "y"
+    use_sb = small_baseline and not phuw_path.is_file() and phuw_sb_path.is_file()
+    use_sm_from_sb = small_baseline and phuw_path.is_file()
+    if use_sb:
+        logger.info("SB export: inverting %s to single-master date phases", phuw_sb_path.name)
+        ph_uw = _load_h5(phuw_sb_path, ["ph_uw"])["ph_uw"].astype(np.float64)
+    else:
+        if not phuw_path.is_file():
+            raise FileNotFoundError(f"Need {phuw_path.name} or {phuw_sb_path.name} in {project_dir}")
+        ph_uw = _load_h5(phuw_path, ["ph_uw"])["ph_uw"].astype(np.float64)
 
     lonlat = np.asarray(ps["lonlat"], dtype=np.float64).reshape(-1, 2)
     xy = np.asarray(ps["xy"], dtype=np.float64)
     if xy.ndim == 1:
         xy = xy.reshape(-1, 3)
     n_ifg = int(np.asarray(ps["n_ifg"]).ravel()[0])
+    n_image = int(np.asarray(ps.get("n_image", [[n_ifg]])).ravel()[0])
     master_ix = int(np.asarray(ps["master_ix"]).ravel()[0]) - 1
     master_day = float(np.asarray(ps["master_day"]).ravel()[0])
     day_full = np.asarray(ps["day"], dtype=np.float64).ravel()
@@ -240,7 +330,7 @@ def _load_corrected_phase(
         raise ValueError("correction must be one of v, v-d, v-do, v-s, v-so, v-ds, v-dso")
 
     if "d" in correction:
-        scla_path = project_dir / f"scla{psver}.h5"
+        scla_path = project_dir / (f"scla_sb{psver}.h5" if use_sb else f"scla{psver}.h5")
         if not scla_path.is_file():
             raise FileNotFoundError(f"{correction} requires {scla_path.name}")
         scla = _load_h5(scla_path, ["ph_scla", "C_ps_uw"])
@@ -264,21 +354,32 @@ def _load_corrected_phase(
             raise ValueError(f"{scn_path.name}/ph_scn_slave shape {ph_scn.shape} != ph_uw {ph_uw.shape}")
         ph_uw -= ph_scn
 
+    if use_sb:
+        ifgday_ix = np.asarray(ps.get("ifgday_ix"))
+        if ifgday_ix.size == 0:
+            raise FileNotFoundError("SB export requires ifgday_ix in ps2.h5")
+        ph_uw = _sb_pairs_to_single_master(ph_uw, ifgday_ix, n_image, master_ix)
+        image_ix = np.array([i for i in range(n_image) if i != master_ix], dtype=np.int64)
+        day = day_full[image_ix]
+        unwrap_ix = np.array([], dtype=np.int64)
+    else:
+        axis_count = ph_uw.shape[1]
+        drop_ix = (
+            np.array([], dtype=np.int64)
+            if use_sm_from_sb
+            else _parse_drop_ifg(StampsConfig(work_dir=project_dir).getparm("drop_ifg_index"), axis_count)
+        )
+        unwrap_ix = np.setdiff1d(np.arange(axis_count), drop_ix)
+        unwrap_ix = np.setdiff1d(unwrap_ix, [master_ix])
+        ph_uw = ph_uw[:, unwrap_ix]
+        day = day_full[unwrap_ix]
+
     if apply_deramp:
         logger.info("Applying ps_deramp to corrected phase")
         ramp = _ps_deramp_inplace(ph_uw, xy, deramp_degree)
     else:
         ramp = np.empty((ph_uw.shape[0], 0), dtype=np.float32)
 
-    drop_ix = _parse_drop_ifg(StampsConfig(work_dir=project_dir).getparm("drop_ifg_index"), n_ifg)
-    unwrap_ix = np.setdiff1d(np.arange(n_ifg), drop_ix)
-    unwrap_ix = np.setdiff1d(unwrap_ix, [master_ix])
-
-    ph_uw = ph_uw[:, unwrap_ix]
-    day = day_full[unwrap_ix]
-    ramp = ramp[:, unwrap_ix] if ramp.size else ramp
-
-    cfg = StampsConfig(work_dir=project_dir)
     ref_ps = _select_reference_ps(lonlat, xy, cfg)
     logger.info("Using %d reference PS", ref_ps.size)
     ph_uw -= np.nanmean(ph_uw[ref_ps, :], axis=0, keepdims=True)
@@ -297,27 +398,91 @@ def _build_full_time_series(
     day: np.ndarray,
     master_day: float,
     wavelength_m: float,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    project_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, list[str], float]:
     dates = np.array(sorted(set(int(round(d)) for d in day) | {int(round(master_day))}), dtype=np.float64)
     ph_mm = np.full((ph_uw.shape[0], dates.size), np.nan, dtype=np.float32)
-    ph_mm[:, :] = 0.0
 
     mm_without_master = _phase_to_mm(ph_uw, wavelength_m).astype(np.float32)
     master_int = int(round(master_day))
+    master_col: Optional[int] = None
     for out_col, d in enumerate(dates):
         d_int = int(round(d))
         if d_int == master_int:
-            ph_mm[:, out_col] = 0.0
+            master_col = out_col
             continue
         src = np.where(np.abs(day - d) < 0.5)[0]
         if src.size:
             ph_mm[:, out_col] = mm_without_master[:, src[0]]
 
-    # Match the user's legacy script: insert master, sort dates, then make the
-    # first acquisition the zero-displacement reference.
+    _fill_missing_time_series_values(ph_mm, dates, master_col=master_col)
+    # Match the user's legacy script: sort dates, then make the first
+    # acquisition the zero-displacement reference.
     ph_mm -= ph_mm[:, [0]]
-    labels = [_matlab_datenum_to_yyyymmdd(d) for d in dates]
-    return ph_mm, dates, labels
+
+    date_offset = _infer_date_offset(project_dir, dates, master_day)
+    labels = [_serial_to_yyyymmdd(d, date_offset) for d in dates]
+    output_dates = dates - date_offset
+    output_master_day = float(master_day - date_offset)
+    return ph_mm, output_dates, labels, output_master_day
+
+
+def _fill_missing_time_series_values(
+    ph_mm: np.ndarray,
+    dates: np.ndarray,
+    master_col: Optional[int] = None,
+) -> None:
+    """Fill missing export dates without creating one-epoch zero spikes.
+
+    The reference/master acquisition is not an observed displacement column in
+    PS mode, and can also be absent after SB inversion.  Older export code
+    eventually converted these NaNs to zero, which creates a sharp artificial
+    spike in otherwise smooth time series.  Fill missing columns from adjacent
+    dates instead; for point-specific NaNs, use the same local interpolation
+    where neighbouring values are finite.
+    """
+    n_col = ph_mm.shape[1]
+    col_has_values = np.isfinite(ph_mm).any(axis=0)
+    for col in range(n_col):
+        missing = ~np.isfinite(ph_mm[:, col])
+        if not bool(np.any(missing)):
+            continue
+
+        prev_cols = np.where(col_has_values[:col])[0]
+        next_cols = np.where(col_has_values[col + 1 :])[0] + col + 1
+        lo = int(prev_cols[-1]) if prev_cols.size else None
+        hi = int(next_cols[0]) if next_cols.size else None
+
+        if lo is not None and hi is not None:
+            w = float((dates[col] - dates[lo]) / max(dates[hi] - dates[lo], 1.0))
+            lo_vals = ph_mm[:, lo]
+            hi_vals = ph_mm[:, hi]
+            both = missing & np.isfinite(lo_vals) & np.isfinite(hi_vals)
+            ph_mm[both, col] = ((1.0 - w) * lo_vals[both] + w * hi_vals[both]).astype(np.float32)
+            only_lo = missing & np.isfinite(lo_vals) & ~np.isfinite(ph_mm[:, col])
+            ph_mm[only_lo, col] = lo_vals[only_lo]
+            only_hi = missing & np.isfinite(hi_vals) & ~np.isfinite(ph_mm[:, col])
+            ph_mm[only_hi, col] = hi_vals[only_hi]
+        elif lo is not None:
+            lo_vals = ph_mm[:, lo]
+            fill = missing & np.isfinite(lo_vals)
+            ph_mm[fill, col] = lo_vals[fill]
+        elif hi is not None:
+            hi_vals = ph_mm[:, hi]
+            fill = missing & np.isfinite(hi_vals)
+            ph_mm[fill, col] = hi_vals[fill]
+
+        remaining = ~np.isfinite(ph_mm[:, col])
+        if bool(np.any(remaining)):
+            label = "master/reference " if master_col == col else ""
+            logger.warning(
+                "Filled %d unresolved %sdate values in column %d with 0",
+                int(np.sum(remaining)),
+                label,
+                col + 1,
+            )
+            ph_mm[remaining, col] = 0.0
+        col_has_values[col] = bool(np.isfinite(ph_mm[:, col]).any())
 
 
 def _write_plot_h5(
@@ -342,6 +507,7 @@ def _write_plot_h5(
         hf.create_dataset("date", data=np.asarray(date_labels, dtype=object), dtype=str_dtype)
         hf.create_dataset("master_day", data=np.array(master_day, dtype=np.float64))
         hf.attrs["correction"] = correction
+        hf.attrs["date_serial"] = "python_ordinal"
 
 
 def _delete_vector(path: Path, driver_name: str) -> None:
@@ -451,13 +617,32 @@ def run_export(
         xy = xy[:max_points]
 
     wavelength_m = float(np.asarray(cfg.getparm("lambda")).ravel()[0])
-    covariance = _load_covariance(input_path, v, unwrap_ix)
+    covariance = (
+        None
+        if str(cfg.getparm("small_baseline_flag") or "n").strip().lower() == "y"
+        else _load_covariance(input_path, v, unwrap_ix)
+    )
     logger.info("Computing velocity for %d PS and %d dates", ph_uw.shape[0], ph_uw.shape[1])
     velocity = _velocity_from_phase(ph_uw, day, master_day, wavelength_m, covariance)
-    ph_mm, dates, date_labels = _build_full_time_series(ph_uw, day, master_day, wavelength_m)
+    ph_mm, dates, date_labels, output_master_day = _build_full_time_series(
+        ph_uw,
+        day,
+        master_day,
+        wavelength_m,
+        input_path,
+    )
 
     out_correction = correction + ("o" if deramp and not correction.endswith("o") else "")
-    _write_plot_h5(output_dir, velocity, ph_mm, lonlat, dates, date_labels, master_day, out_correction)
+    _write_plot_h5(
+        output_dir,
+        velocity,
+        ph_mm,
+        lonlat,
+        dates,
+        date_labels,
+        output_master_day,
+        out_correction,
+    )
 
     output_format = output_format.lower()
     if output_format in {"gpkg", "both"}:

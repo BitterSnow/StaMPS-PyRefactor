@@ -1129,6 +1129,16 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO).",
     )
+    parser.add_argument(
+        "--merge-resample-size",
+        type=int,
+        default=None,
+        metavar="METRES",
+        help=(
+            "Override merge_resample_size for this run only. "
+            "Use 0 to disable SB grid resampling and keep dense merged points."
+        ),
+    )
     return parser
 
 
@@ -1175,6 +1185,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         runner = StampsRunner(project_dir=project_dir)
+        if args.merge_resample_size is not None:
+            if args.merge_resample_size < 0:
+                raise ValueError("--merge-resample-size must be >= 0")
+            runner._config.setparm("merge_resample_size", args.merge_resample_size, new_flag=2)
+            logger.info(
+                "Runtime override: merge_resample_size=%d",
+                args.merge_resample_size,
+            )
         runner.run(start_step=args.start, end_step=args.end)
     except FileNotFoundError as exc:
         logger.error("Missing required file: %s", exc)

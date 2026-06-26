@@ -590,9 +590,23 @@ class PatchMerger:
         bperp_mat_all = _vstack_safe(all_bperp_mat)[final_ix] if all_bperp_mat else np.empty((0, 0))
         ph_all = _vstack_safe(all_ph)[final_ix] if all_ph else np.empty((0, 0))
 
-        la_all = _vstack_safe(all_la)[final_ix] if all_la else None
-        inc_all = _vstack_safe(all_inc)[final_ix] if all_inc else None
-        hgt_all = _vstack_safe(all_hgt)[final_ix] if all_hgt else None
+        def _optional_merged(arrs: List[np.ndarray], name: str) -> Optional[np.ndarray]:
+            if not arrs:
+                return None
+            arr = _vstack_safe(arrs)
+            if arr.shape[0] != n_ps_orig:
+                logger.warning(
+                    "Skipping merged %s: optional rows %d do not match merged source rows %d",
+                    name,
+                    arr.shape[0],
+                    n_ps_orig,
+                )
+                return None
+            return arr[final_ix]
+
+        la_all = _optional_merged(all_la, "la")
+        inc_all = _optional_merged(all_inc, "inc")
+        hgt_all = _optional_merged(all_hgt, "hgt")
 
         # ---- Save merged files at project root (MATLAB lines 534-643) ----
         out = self.project_dir
@@ -819,21 +833,38 @@ class PatchMerger:
 
         # Load pm for weight computation
         pm = _load_h5_or_mat(pdir, f"pm{v}", ["ph_res", "coh_ps", "C_ps"])
-        ph_res_raw = np.asarray(pm["ph_res"])
+        ph_res_raw = np.asarray(pm["ph_res"]) if "ph_res" in pm else np.empty(0)
         C_ps_raw = np.asarray(pm["C_ps"]).ravel()
+        coh_pm = np.asarray(pm["coh_ps"]).ravel() if "coh_ps" in pm else np.empty(0)
 
-        # Centralise ph_res about zero (MATLAB line 133)
-        ph_res_ctr = np.angle(np.exp(1j * (ph_res_raw - C_ps_raw[:, None])))
-        if small_baseline_flag != "y":
-            ph_res_ctr = np.column_stack([ph_res_ctr, C_ps_raw])
-
-        sigsq_noise = np.var(ph_res_ctr, axis=1, ddof=1)
-        coh_ps_all = np.abs(np.sum(np.exp(1j * ph_res_ctr), axis=1)) / n_ifg
-        coh_ps_all = np.minimum(coh_ps_all, max_coh)
+        # Centralise ph_res about zero (MATLAB line 133). Some lightweight
+        # Step-4 outputs intentionally keep ph_res empty; in that case use the
+        # saved coherence and a conservative phase-accuracy variance for merge
+        # weights instead of manufacturing NaN weights from empty residuals.
+        use_ph_res = (
+            ph_res_raw.ndim >= 2
+            and ph_res_raw.shape[0] == n_ps_patch
+            and ph_res_raw.shape[1] > 0
+        )
+        if use_ph_res:
+            ph_res_ctr = np.angle(np.exp(1j * (ph_res_raw - C_ps_raw[:, None])))
+            if small_baseline_flag != "y":
+                ph_res_ctr = np.column_stack([ph_res_ctr, C_ps_raw])
+            sigsq_noise = np.var(ph_res_ctr, axis=1, ddof=1)
+            coh_ps_all = np.abs(np.sum(np.exp(1j * ph_res_ctr), axis=1)) / n_ifg
+        else:
+            sigsq_noise = np.full(n_ps_patch, phase_accuracy ** 2, dtype=np.float64)
+            if coh_pm.shape[0] == n_ps_patch:
+                coh_ps_all = coh_pm.astype(np.float64, copy=False)
+            else:
+                coh_ps_all = np.zeros(n_ps_patch, dtype=np.float64)
+        coh_ps_all = np.clip(coh_ps_all, 0.0, min(float(max_coh), 1.0 - 1e-6))
+        sigsq_noise = np.nan_to_num(sigsq_noise, nan=phase_accuracy ** 2, posinf=phase_accuracy ** 2)
         sigsq_noise = np.maximum(sigsq_noise, phase_accuracy ** 2)
 
         ps_weight = 1.0 / sigsq_noise[ix_idx]
         ps_snr = 1.0 / (1.0 / coh_ps_all[ix_idx] ** 2 - 1.0)
+        ps_snr = np.nan_to_num(ps_snr, nan=0.0, posinf=1e6, neginf=0.0)
 
         # Group boundaries
         changes = np.where(np.diff(g_ix))[0]
@@ -844,10 +875,17 @@ class PatchMerger:
         # Weight threshold check
         for gi in range(n_ps_g):
             sl = slice(f_ix[gi], l_ix[gi] + 1)
-            if ps_weight[sl].sum() < min_weight:
+            ws = ps_weight[sl].sum()
+            if (not np.isfinite(ws)) or ws <= 0 or ws < min_weight:
                 ix_idx[sl] = -1  # mark for removal
 
-        valid = ix_idx >= 0
+        valid = (
+            (ix_idx >= 0)
+            & np.isfinite(ps_weight)
+            & (ps_weight > 0)
+            & np.isfinite(ps_snr)
+            & (ps_snr >= 0)
+        )
         g_ix = g_ix[valid]
         ps_weight = ps_weight[valid]
         ps_snr = ps_snr[valid]
@@ -869,6 +907,8 @@ class PatchMerger:
             sl = slice(f_ix[gi], l_ix[gi] + 1)
             w = ps_weight[sl]
             ws = w.sum()
+            if (not np.isfinite(ws)) or ws <= 0:
+                continue
             ij_g[gi] = np.round(np.sum(ij_patch[ix_idx[sl], 1:3] * w[:, None], axis=0) / ws)
             lonlat_g[gi] = np.sum(lonlat_patch[ix_idx[sl]] * w[:, None], axis=0) / ws
 
@@ -927,7 +967,12 @@ class PatchMerger:
         pp_data = np.asarray(pm["ph_patch"])
         pp_ncol = pp_data.shape[1]
         pp_g = np.zeros((n_ps_g, pp_ncol), dtype=np.complex128)
-        pr_g = np.zeros((n_ps_g, pp_ncol)) if "ph_res" in pm else None
+        pr_raw = np.asarray(pm["ph_res"]) if "ph_res" in pm else None
+        if pr_raw is not None and (
+            pr_raw.ndim < 2 or pr_raw.shape[0] <= int(ix_idx.max())
+        ):
+            pr_raw = None
+        pr_g = np.zeros((n_ps_g, pp_ncol)) if pr_raw is not None else None
         K_g = np.zeros((n_ps_g, 1)) if "K_ps" in pm else None
         C_g = np.zeros((n_ps_g, 1)) if "C_ps" in pm else None
         coh_g = np.zeros((n_ps_g, 1)) if "coh_ps" in pm else None
@@ -935,7 +980,6 @@ class PatchMerger:
         K_raw = np.asarray(pm["K_ps"]).ravel() if "K_ps" in pm else None
         C_raw = np.asarray(pm["C_ps"]).ravel() if "C_ps" in pm else None
         coh_raw = np.asarray(pm["coh_ps"]).ravel() if "coh_ps" in pm else None
-        pr_raw = np.asarray(pm["ph_res"]) if "ph_res" in pm else None
 
         for gi in range(n_ps_g):
             sl = slice(f_ix[gi], l_ix[gi] + 1)
@@ -951,7 +995,10 @@ class PatchMerger:
                 C_g[gi, 0] = np.sum(C_raw[ix_idx[sl]] * w_ph) / ws_ph
             if coh_g is not None:
                 snr_sum = np.sqrt(np.sum(w_snr ** 2))
-                coh_g[gi, 0] = np.sqrt(1.0 / (1.0 + 1.0 / snr_sum))
+                if snr_sum > 0 and np.isfinite(snr_sum):
+                    coh_g[gi, 0] = np.sqrt(1.0 / (1.0 + 1.0 / snr_sum))
+                else:
+                    coh_g[gi, 0] = 0.0
 
         all_ph_patch.append(pp_g.astype(np.complex64))
         if pr_g is not None:
@@ -983,11 +1030,22 @@ class PatchMerger:
             arr = _load_optional(pdir, basename, key)
             if arr is not None:
                 arr = arr.ravel()
+                if arr.shape[0] <= int(ix_idx.max()):
+                    logger.warning(
+                        "Skipping %s for %s: optional rows %d do not cover selected index %d",
+                        basename,
+                        pdir.name,
+                        arr.shape[0],
+                        int(ix_idx.max()),
+                    )
+                    continue
                 arr_g = np.zeros((n_ps_g, 1))
                 for gi in range(n_ps_g):
                     sl = slice(f_ix[gi], l_ix[gi] + 1)
                     w = ps_weight[sl]
-                    arr_g[gi, 0] = np.sum(arr[ix_idx[sl]] * w) / w.sum()
+                    ws = w.sum()
+                    if ws > 0 and np.isfinite(ws):
+                        arr_g[gi, 0] = np.sum(arr[ix_idx[sl]] * w) / ws
                 arr_list.append(arr_g)
 
 

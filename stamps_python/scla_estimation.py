@@ -335,7 +335,15 @@ class SclaEstimator:
             logger.info("SB mode: ps_calc_scla(1,1) → ps_smooth_scla(1) → ps_calc_scla(0,1)")
             self.calc_scla(use_small_baselines=True, coest_mean_vel=True)
             self.smooth_scla(use_small_baselines=True)
-            self.calc_scla(use_small_baselines=False, coest_mean_vel=True)
+            phuw_sm = self.patch_dir / f"phuw{self.psver}.h5"
+            if phuw_sm.is_file():
+                self.calc_scla(use_small_baselines=False, coest_mean_vel=True)
+            else:
+                logger.warning(
+                    "Skipping ps_calc_scla(0,1): %s not found. "
+                    "This is expected until sb_invert_uw writes single-master unwrapped phase.",
+                    phuw_sm.name,
+                )
         else:
             logger.info("SM mode: ps_calc_scla(0,1) → ps_smooth_scla()")
             self.calc_scla(use_small_baselines=False, coest_mean_vel=True)
@@ -747,6 +755,10 @@ class SclaEstimator:
             elif iix.ndim == 2 and iix.shape[1] == 1:
                 # day_ix style: just sequential indices
                 iix = None
+            if iix is not None:
+                iix = iix.astype(np.int32, copy=False)
+                if iix.size > 0 and iix.min() >= 1:
+                    iix = iix - 1
             raw["ifgday_ix"] = iix
 
         return raw
